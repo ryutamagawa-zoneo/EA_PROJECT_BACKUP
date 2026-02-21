@@ -1,0 +1,14 @@
+﻿StopMode=2
+StopReason=PASS_TARGET_REACHED
+BotStopIssued=True
+LastServerDate=2026-02-14
+MllBaseBalance=200000
+HighWaterBalance=200000
+TrailingFloor=197000
+FloorLocked=False
+ClosedPnlDate=2026-02-14
+ClosedProfitToday=0
+DynamicTargetProfitAmount=8000
+LastPayoutStage=0
+PayoutResetApplied=False
+LastRunMode=0

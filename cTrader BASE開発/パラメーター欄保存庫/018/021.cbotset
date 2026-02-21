@@ -1,0 +1,37 @@
+﻿{
+  "Chart": {
+    "Symbol": "XAUUSD",
+    "Period": "m5"
+  },
+  "Parameters": {
+    "AccountCurrency": 1,
+    "RiskDollars": 0.0,
+    "RiskPercent": 1.0,
+    "RiskBufferPips": 50.0,
+    "SlipAllowancePips": 50.0,
+    "EmergencyCloseMult": 1.2,
+    "MaxPositions": 1,
+    "MaxLotsCap": 2.5,
+    "BreakevenTriggerDollars": 0.0,
+    "MaxSpreadPips": 0.0,
+    "MinSLPips": 20.0,
+    "MinSlAtrPeriod": 14,
+    "MinSlAtrMult": 0.5,
+    "MinTpDistancePips": 0.0,
+    "BuyOnly": false,
+    "SellOnly": false,
+    "EnableEmaDirectionFilter": false,
+    "EmaPeriod": 20,
+    "MinRRRatio": 1.0,
+    "EnableDebugLogJst": false,
+    "UseNewsBacktest2025": false,
+    "UseNewsForwardFRED": true,
+    "FredApiKey": "3da703326c41e0bff433e0867368206c",
+    "MinutesBeforeNews": 60,
+    "MinutesAfterNews": 60,
+    "EnableTradingWindowFilter": false,
+    "TradeStartTimeJst": "09:15",
+    "TradeEndTimeJst": "02:00",
+    "ForceFlatTimeJst": "02:50"
+  }
+}

@@ -1,0 +1,453 @@
+// CODE NAME: HL_VIEW_DATA_010_002
+// ROLE: HL_VIEW_010_001 と同一ロジックでPivot系列を算出し、[Output] として公開（描画なし）
+
+using System;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace EA_Dev.HighLow
+{
+    [Indicator(IsOverlay = false, TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class HL_VIEW_DATA_010_002 : Indicator
+    {
+        [Parameter("ZZ_Depth", Group = "ロジック", DefaultValue = 12, MinValue = 2)]
+        public int ZZ_Depth { get; set; }
+
+        [Parameter("points（Deviation相当）", Group = "ロジック", DefaultValue = 50, MinValue = 0)]
+        public double points { get; set; }
+
+        [Parameter("ZZ_Backstep", Group = "ロジック", DefaultValue = 3, MinValue = 0, MaxValue = 50)]
+        public int ZZ_Backstep { get; set; }
+
+        [Parameter("連続スイング抑制（ポイント）0=無効", Group = "ロジック", DefaultValue = 0, MinValue = 0)]
+        public double 連続スイング抑制ポイント { get; set; }
+
+        [Parameter("同値は右側優先（MT5寄せ）", Group = "ロジック", DefaultValue = true)]
+        public bool 同値右優先 { get; set; }
+
+        public enum 同一足優先モード
+        {
+            前回スイングと逆を優先 = 0,
+            Highを優先 = 1,
+            Lowを優先 = 2
+        }
+
+        [Parameter("同一足でHigh/Low両成立時の優先", Group = "ロジック", DefaultValue = 同一足優先モード.前回スイングと逆を優先)]
+        public 同一足優先モード 同一足優先 { get; set; }
+
+        [Parameter("Pivotログ出力", Group = "ログ", DefaultValue = false)]
+        public bool Pivotログ出力 { get; set; }
+
+
+        // Outputs: Pivotが確定したバーのみ価格、他はNaN
+        [Output("M5 Pivot High", PlotType = PlotType.Points)]
+        public IndicatorDataSeries M5_PivotHigh { get; set; }
+
+        [Output("M5 Pivot Low", PlotType = PlotType.Points)]
+        public IndicatorDataSeries M5_PivotLow { get; set; }
+
+        // HH=+2, LH=+1, HL=-1, LL=-2, 初回は 0
+        [Output("M5 Pivot Type", PlotType = PlotType.Points)]
+        public IndicatorDataSeries M5_PivotType { get; set; }
+
+        [Output("H1 Pivot High (M5 Projected)", PlotType = PlotType.Points)]
+        public IndicatorDataSeries H1_PivotHigh_M5 { get; set; }
+
+        [Output("H1 Pivot Low (M5 Projected)", PlotType = PlotType.Points)]
+        public IndicatorDataSeries H1_PivotLow_M5 { get; set; }
+
+        [Output("H1 Pivot Type (M5 Projected)", PlotType = PlotType.Points)]
+        public IndicatorDataSeries H1_PivotType_M5 { get; set; }
+
+        private const int RightBars_M5 = 1;
+        private const int RightBars_H1 = 2;
+
+        private Bars _h1Bars;
+
+        private int _lastM5Candidate = -1;
+        private int _h1AvailableLastIndex = -1;
+        private int _lastH1Candidate = -1;
+
+        private struct Pivot
+        {
+            public int Index;      // native TF index
+            public DateTime Time;
+            public double Price;
+            public int Side;       // +1 high, -1 low
+        }
+
+        private Pivot? _lastM5;
+        private Pivot? _lastH1;
+
+        private double? _prevHighM5;
+        private double? _prevLowM5;
+        private double? _prevHighH1;
+        private double? _prevLowH1;
+
+        protected override void Initialize()
+        {
+            _h1Bars = MarketData.GetBars(TimeFrame.Hour);
+        }
+
+        public override void Calculate(int index)
+        {
+            // init outputs
+            M5_PivotHigh[index] = double.NaN;
+            M5_PivotLow[index] = double.NaN;
+            M5_PivotType[index] = double.NaN;
+
+            H1_PivotHigh_M5[index] = double.NaN;
+            H1_PivotLow_M5[index] = double.NaN;
+            H1_PivotType_M5[index] = double.NaN;
+
+            // M5 confirm
+            int maxCandidateM5 = index - RightBars_M5;
+            if (maxCandidateM5 > _lastM5Candidate)
+            {
+                for (int i = _lastM5Candidate + 1; i <= maxCandidateM5; i++)
+                    ProcessCandidateM5(i);
+                _lastM5Candidate = maxCandidateM5;
+            }
+
+            // H1 advance availability by current M5 time
+            if (_h1Bars != null && _h1Bars.Count > 10)
+            {
+                DateTime t = Bars.OpenTimes[index];
+
+                int next = _h1AvailableLastIndex + 1;
+                while (next < _h1Bars.Count && _h1Bars.OpenTimes[next] <= t)
+                {
+                    _h1AvailableLastIndex = next;
+                    next++;
+                }
+
+                int maxCandidateH1 = _h1AvailableLastIndex - RightBars_H1;
+                if (maxCandidateH1 > _lastH1Candidate)
+                {
+                    for (int i = _lastH1Candidate + 1; i <= maxCandidateH1; i++)
+                        ProcessCandidateH1(i);
+                    _lastH1Candidate = maxCandidateH1;
+                }
+            }
+        }
+
+        private void ProcessCandidateM5(int i)
+        {
+            if (i < ZZ_Depth) return;
+            if (i >= Bars.Count) return;
+
+            int startIndex = 0;
+            int maxCandidate = Bars.Count - 1 - RightBars_M5;
+            if (i > maxCandidate) return;
+
+            bool isHigh = IsPivotHigh(Bars, i, startIndex, maxCandidate, ZZ_Depth, RightBars_M5, 同値右優先);
+            bool isLow = IsPivotLow(Bars, i, startIndex, maxCandidate, ZZ_Depth, RightBars_M5, 同値右優先);
+
+            ResolveSameBarPriority(ref isHigh, ref isLow, _lastM5, 同一足優先);
+
+            double deviation = GetDeviationPrice(points);
+            double suppress = GetDeviationPrice(連続スイング抑制ポイント);
+
+            if (isHigh)
+            {
+                var c = new Pivot { Index = i, Time = Bars.OpenTimes[i], Price = Bars.HighPrices[i], Side = +1 };
+                if (TryAcceptPivot_M5(c, deviation, suppress, ZZ_Backstep)) return;
+            }
+
+            if (isLow)
+            {
+                var c = new Pivot { Index = i, Time = Bars.OpenTimes[i], Price = Bars.LowPrices[i], Side = -1 };
+                TryAcceptPivot_M5(c, deviation, suppress, ZZ_Backstep);
+            }
+        }
+
+        private void ProcessCandidateH1(int i)
+        {
+            if (_h1Bars == null) return;
+            if (i < ZZ_Depth) return;
+            if (i >= _h1Bars.Count) return;
+
+            int startIndex = Math.Max(0, _h1Bars.Count - 5000);
+            int maxCandidate = _h1AvailableLastIndex - RightBars_H1;
+            if (i < startIndex || i > maxCandidate) return;
+
+            bool isHigh = IsPivotHigh(_h1Bars, i, startIndex, maxCandidate, ZZ_Depth, RightBars_H1, 同値右優先);
+            bool isLow = IsPivotLow(_h1Bars, i, startIndex, maxCandidate, ZZ_Depth, RightBars_H1, 同値右優先);
+
+            ResolveSameBarPriority(ref isHigh, ref isLow, _lastH1, 同一足優先);
+
+            double deviation = GetDeviationPrice(points);
+            double suppress = GetDeviationPrice(連続スイング抑制ポイント);
+
+            if (isHigh)
+            {
+                var c = new Pivot { Index = i, Time = _h1Bars.OpenTimes[i], Price = _h1Bars.HighPrices[i], Side = +1 };
+                if (TryAcceptPivot_H1(c, deviation, suppress, ZZ_Backstep)) return;
+            }
+
+            if (isLow)
+            {
+                var c = new Pivot { Index = i, Time = _h1Bars.OpenTimes[i], Price = _h1Bars.LowPrices[i], Side = -1 };
+                TryAcceptPivot_H1(c, deviation, suppress, ZZ_Backstep);
+            }
+        }
+
+        private static void ResolveSameBarPriority(ref bool isHigh, ref bool isLow, Pivot? last, 同一足優先モード mode)
+        {
+            if (!(isHigh && isLow)) return;
+
+            switch (mode)
+            {
+                case 同一足優先モード.Highを優先:
+                    isLow = false; break;
+                case 同一足優先モード.Lowを優先:
+                    isHigh = false; break;
+                default:
+                    if (last.HasValue)
+                    {
+                        if (last.Value.Side == +1) isHigh = false;
+                        else isLow = false;
+                    }
+                    else
+                    {
+                        isLow = false; // first: High wins
+                    }
+                    break;
+            }
+        }
+
+        private double GetDeviationPrice(double pts) => (pts <= 0) ? 0 : pts * Symbol.TickSize;
+
+        private static bool IsPivotHigh(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double h = bars.HighPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.HighPrices[k] > h) return false;
+                if (tieRight && k > i && bars.HighPrices[k] == h) return false;
+            }
+            return true;
+        }
+
+        private static bool IsPivotLow(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double l = bars.LowPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.LowPrices[k] < l) return false;
+                if (tieRight && k > i && bars.LowPrices[k] == l) return false;
+            }
+            return true;
+        }
+
+        private bool TryAcceptPivot_M5(Pivot candidate, double deviation, double suppress, int backstep)
+        {
+            if (suppress > 0 && _lastM5.HasValue && Math.Abs(candidate.Price - _lastM5.Value.Price) < suppress)
+                return false;
+
+            if (!_lastM5.HasValue)
+            {
+                _lastM5 = candidate;
+                WriteM5Output(candidate);
+                return true;
+            }
+
+            var prev = _lastM5.Value;
+
+            if (candidate.Side == prev.Side)
+            {
+                if (backstep > 0 && (candidate.Index - prev.Index) <= backstep)
+                {
+                    bool moreExtreme =
+                        (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                        (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                    if (moreExtreme)
+                    {
+                        ClearM5Output(prev);
+                        _lastM5 = candidate;
+                        WriteM5Output(candidate);
+                        return true;
+                    }
+                    return false;
+                }
+
+                bool replace =
+                    (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                    (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                if (replace)
+                {
+                    ClearM5Output(prev);
+                    _lastM5 = candidate;
+                    WriteM5Output(candidate);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (deviation > 0 && Math.Abs(candidate.Price - prev.Price) < deviation)
+                return false;
+
+            _lastM5 = candidate;
+            WriteM5Output(candidate);
+            return true;
+        }
+
+        private bool TryAcceptPivot_H1(Pivot candidate, double deviation, double suppress, int backstep)
+        {
+            if (suppress > 0 && _lastH1.HasValue && Math.Abs(candidate.Price - _lastH1.Value.Price) < suppress)
+                return false;
+
+            if (!_lastH1.HasValue)
+            {
+                _lastH1 = candidate;
+                WriteH1OutputProjected(candidate);
+                return true;
+            }
+
+            var prev = _lastH1.Value;
+
+            if (candidate.Side == prev.Side)
+            {
+                if (backstep > 0 && (candidate.Index - prev.Index) <= backstep)
+                {
+                    bool moreExtreme =
+                        (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                        (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                    if (moreExtreme)
+                    {
+                        ClearH1OutputProjected(prev);
+                        _lastH1 = candidate;
+                        WriteH1OutputProjected(candidate);
+                        return true;
+                    }
+                    return false;
+                }
+
+                bool replace =
+                    (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                    (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                if (replace)
+                {
+                    ClearH1OutputProjected(prev);
+                    _lastH1 = candidate;
+                    WriteH1OutputProjected(candidate);
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (deviation > 0 && Math.Abs(candidate.Price - prev.Price) < deviation)
+                return false;
+
+            _lastH1 = candidate;
+            WriteH1OutputProjected(candidate);
+            return true;
+        }
+
+        private void WriteM5Output(Pivot p)
+        {
+            if (p.Index < 0 || p.Index >= Bars.Count) return;
+
+            if (p.Side == +1) M5_PivotHigh[p.Index] = p.Price;
+            else M5_PivotLow[p.Index] = p.Price;
+
+            int type = ComputePivotType_M5(p);
+
+            M5_PivotType[p.Index] = type;
+            PrintPivotLog("M5", p, type);
+        }
+
+        private void ClearM5Output(Pivot p)
+        {
+            if (p.Index < 0 || p.Index >= Bars.Count) return;
+
+            if (p.Side == +1) M5_PivotHigh[p.Index] = double.NaN;
+            else M5_PivotLow[p.Index] = double.NaN;
+
+            M5_PivotType[p.Index] = double.NaN;
+        }
+
+        private void WriteH1OutputProjected(Pivot p)
+        {
+            int m5Index = ProjectH1TimeToM5Index(p.Time);
+            if (m5Index < 0 || m5Index >= Bars.Count) return;
+
+            if (p.Side == +1) H1_PivotHigh_M5[m5Index] = p.Price;
+            else H1_PivotLow_M5[m5Index] = p.Price;
+
+            int type = ComputePivotType_H1(p);
+
+            H1_PivotType_M5[m5Index] = type;
+            // H1はM5へ投影しているが、Pivot自体のIndexはH1ネイティブ
+            PrintPivotLog("H1", p, type);
+        }
+
+        private void ClearH1OutputProjected(Pivot p)
+        {
+            int m5Index = ProjectH1TimeToM5Index(p.Time);
+            if (m5Index < 0 || m5Index >= Bars.Count) return;
+
+            if (p.Side == +1) H1_PivotHigh_M5[m5Index] = double.NaN;
+            else H1_PivotLow_M5[m5Index] = double.NaN;
+
+            H1_PivotType_M5[m5Index] = double.NaN;
+        }
+
+                private void PrintPivotLog(string tf, Pivot p, int type)
+        {
+            if (!Pivotログ出力) return;
+            string side = (p.Side == +1) ? "H" : "L";
+            // EA側の表記に寄せる（idx / t / side / price / type）
+            Print($"{tf} PIVOT idx={p.Index} t={p.Time:yyyy-MM-dd HH:mm} side={side} price={p.Price:F2} type={type} (HH=+2 LH=+1 HL=-1 LL=-2)");
+        }
+
+private int ProjectH1TimeToM5Index(DateTime h1Time)
+        {
+            try { return Bars.OpenTimes.GetIndexByTime(h1Time); }
+            catch { return -1; }
+        }
+
+        // label-equivalent type computation
+        private int ComputePivotType_M5(Pivot p)
+        {
+            if (p.Side == +1)
+            {
+                if (_prevHighM5.HasValue) return (p.Price > _prevHighM5.Value) ? +2 : +1;
+                _prevHighM5 = p.Price; return 0;
+            }
+            else
+            {
+                if (_prevLowM5.HasValue) return (p.Price > _prevLowM5.Value) ? -1 : -2;
+                _prevLowM5 = p.Price; return 0;
+            }
+        }
+
+        private int ComputePivotType_H1(Pivot p)
+        {
+            if (p.Side == +1)
+            {
+                if (_prevHighH1.HasValue) return (p.Price > _prevHighH1.Value) ? +2 : +1;
+                _prevHighH1 = p.Price; return 0;
+            }
+            else
+            {
+                if (_prevLowH1.HasValue) return (p.Price > _prevLowH1.Value) ? -1 : -2;
+                _prevLowH1 = p.Price; return 0;
+            }
+        }
+    }
+}

@@ -1,0 +1,547 @@
+// CODE NAME: HL_VIEW_010_002
+// ROLE: HighLow 可視化（M5=赤, H1=白）
+// NOTE: RightBars 固定：M5=1 / H1=2
+// CHANGE: Pivotログ出力パラメータ追加（Default=true）
+// CHANGE: Pivotログは可視範囲フィルタ無し（全Pivot出力）※判定履歴ズレ防止
+
+using System;
+using System.Collections.Generic;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace EA_Dev.HighLow
+{
+    [Indicator(IsOverlay = true, TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class HL_VIEW_010_001 : Indicator
+    {
+        [Parameter("描画有効（マスター）", Group = "表示", DefaultValue = true)]
+        public bool 描画有効 { get; set; }
+
+        [Parameter("5分足（赤）を表示", Group = "表示", DefaultValue = true)]
+        public bool M5表示 { get; set; }
+
+        [Parameter("1時間足（白）を表示", Group = "表示", DefaultValue = true)]
+        public bool H1表示 { get; set; }
+
+        [Parameter("表示範囲の余裕本数", Group = "最適化", DefaultValue = 80, MinValue = 0, MaxValue = 20000)]
+        public int 表示範囲余裕本数 { get; set; }
+
+        [Parameter("再描画間隔（ミリ秒）", Group = "最適化", DefaultValue = 250, MinValue = 50, MaxValue = 5000)]
+        public int 再描画間隔ms { get; set; }
+
+        [Parameter("ラベルを表示", Group = "ラベル", DefaultValue = true)]
+        public bool ラベル表示 { get; set; }
+
+        [Parameter("ラベル文字サイズ", Group = "ラベル", DefaultValue = 9, MinValue = 6, MaxValue = 30)]
+        public int ラベル文字サイズ { get; set; }
+
+        [Parameter("ラベルYオフセット（Tick）", Group = "ラベル", DefaultValue = 1, MinValue = 0, MaxValue = 20)]
+        public int ラベルYオフセットTick { get; set; }
+
+        [Parameter("H1ラベル接頭辞", Group = "ラベル", DefaultValue = "H1-")]
+        public string H1接頭辞 { get; set; }
+
+        [Parameter("5分足 線の色", Group = "5分足", DefaultValue = "Red")]
+        public string M5線色 { get; set; }
+
+        [Parameter("5分足 線の太さ", Group = "5分足", DefaultValue = 1, MinValue = 1, MaxValue = 5)]
+        public int M5線太さ { get; set; }
+
+        [Parameter("5分足 線の種類", Group = "5分足", DefaultValue = LineStyle.Solid)]
+        public LineStyle M5線種 { get; set; }
+
+        [Parameter("1時間足 線の色", Group = "1時間足", DefaultValue = "White")]
+        public string H1線色 { get; set; }
+
+        [Parameter("1時間足 線の太さ", Group = "1時間足", DefaultValue = 2, MinValue = 1, MaxValue = 5)]
+        public int H1線太さ { get; set; }
+
+        [Parameter("1時間足 線の種類", Group = "1時間足", DefaultValue = LineStyle.Solid)]
+        public LineStyle H1線種 { get; set; }
+
+        [Parameter("ZZ_Depth", Group = "ロジック", DefaultValue = 12, MinValue = 2)]
+        public int ZZ_Depth { get; set; }
+
+        [Parameter("points（Deviation相当）", Group = "ロジック", DefaultValue = 50, MinValue = 0)]
+        public double points { get; set; }
+
+        [Parameter("ZZ_Backstep", Group = "ロジック", DefaultValue = 3, MinValue = 0, MaxValue = 50)]
+        public int ZZ_Backstep { get; set; }
+
+        [Parameter("連続スイング抑制（ポイント）0=無効", Group = "ロジック", DefaultValue = 0, MinValue = 0)]
+        public double 連続スイング抑制ポイント { get; set; }
+
+        [Parameter("同値は右側優先（MT5寄せ）", Group = "ロジック", DefaultValue = true)]
+        public bool 同値右優先 { get; set; }
+
+        public enum 同一足優先モード
+        {
+            前回スイングと逆を優先 = 0,
+            Highを優先 = 1,
+            Lowを優先 = 2
+        }
+
+        [Parameter("同一足でHigh/Low両成立時の優先", Group = "ロジック", DefaultValue = 同一足優先モード.前回スイングと逆を優先)]
+        public 同一足優先モード 同一足優先 { get; set; }
+
+        // ★追加：Pivotログ出力（Default=true）
+        [Parameter("Pivotログ出力", Group = "ログ", DefaultValue = true)]
+        public bool Pivotログ出力 { get; set; }
+
+        [Parameter("描画デバッグログ出力", Group = "ログ", DefaultValue = true)]
+        public bool 描画デバッグログ出力 { get; set; }
+
+
+        private const int RightBars_M5 = 1;
+        private const int RightBars_H1 = 2;
+
+        private const string Prefix = "HL_VIEW_010_002";
+        private readonly List<string> _names = new List<string>(8000);
+
+        private Bars _h1Bars;
+
+        private int _lastFirst = int.MinValue;
+        private int _lastLast = int.MinValue;
+        private int _lastBarsCount = -1;
+        private DateTime _lastRedraw = DateTime.MinValue;
+
+        // ★追加：ログ重複抑止キー（範囲・本数・末尾Indexなどで作る）
+        private string _lastLogKeyM5 = "";
+        private string _lastLogKeyH1 = "";
+
+        private struct Pivot
+        {
+            public int Index;
+            public DateTime Time;
+            public double Price;
+            public int Side; // +1 high, -1 low
+        }
+
+        protected override void Initialize()
+        {
+            _h1Bars = MarketData.GetBars(TimeFrame.Hour);
+
+            try { Chart.ZoomChanged += _ => ForceRedraw(); } catch { }
+            try { Chart.ScrollChanged += _ => ForceRedraw(); } catch { }
+
+            Timer.Start(TimeSpan.FromMilliseconds(Math.Max(50, 再描画間隔ms)));
+        }
+
+        protected override void OnTimer()
+        {
+            if (!描画有効) return;
+
+            if ((DateTime.UtcNow - _lastRedraw).TotalMilliseconds < 再描画間隔ms - 5)
+                return;
+
+            if (NeedRedraw())
+                Redraw();
+        }
+
+        public override void Calculate(int index)
+        {
+            if (index != Bars.Count - 1)
+                return;
+
+            if (!描画有効)
+            {
+                ClearDrawings();
+                return;
+            }
+
+            if (NeedRedraw())
+                Redraw();
+        }
+
+        private bool NeedRedraw()
+        {
+            int first, last;
+            GetVisibleRange(out first, out last);
+
+            return first != _lastFirst ||
+                   last != _lastLast ||
+                   Bars.Count != _lastBarsCount;
+        }
+
+        private void ForceRedraw()
+        {
+            _lastFirst = int.MinValue;
+            _lastLast = int.MinValue;
+        }
+
+        private void Redraw()
+        {
+            _lastRedraw = DateTime.UtcNow;
+
+            int first, last;
+            GetVisibleRange(out first, out last);
+
+            _lastFirst = first;
+            _lastLast = last;
+            _lastBarsCount = Bars.Count;
+
+            ClearDrawings();
+
+            if (M5表示)
+            {
+                var pivM5 = BuildPivots(Bars, RightBars_M5, first, last);
+
+                // ★追加：M5 Pivotログ（全Pivot出力）
+                if (Pivotログ出力)
+                    LogPivotsIfNeeded_All("M5", pivM5, Bars, ref _lastLogKeyM5);
+
+                DrawZigZagAndLabels(pivM5, Bars, ParseColor(M5線色, Color.Red), M5線太さ, M5線種, labelPrefix: "");
+            }
+
+            if (H1表示 && _h1Bars != null && _h1Bars.Count > 10)
+            {
+                var pivH1 = BuildPivots(_h1Bars, RightBars_H1, null, null);
+
+                // ★追加：H1 Pivotログ（全Pivot出力）
+                if (Pivotログ出力)
+                    LogPivotsIfNeeded_All("H1", pivH1, _h1Bars, ref _lastLogKeyH1);
+
+                var proj = ProjectToM5(pivH1, first, last);
+                DrawZigZagAndLabels(proj, Bars, ParseColor(H1線色, Color.White), H1線太さ, H1線種, labelPrefix: (H1接頭辞 ?? ""));
+            }
+        }
+
+        private void GetVisibleRange(out int first, out int last)
+        {
+            first = 0;
+            last = Bars.Count - 1;
+
+            try
+            {
+                first = Chart.FirstVisibleBarIndex;
+                last = Chart.LastVisibleBarIndex;
+            }
+            catch
+            {
+                first = 0;
+                last = Bars.Count - 1;
+            }
+
+            if (first < 0) first = 0;
+            if (last < 0) last = Bars.Count - 1;
+            if (last >= Bars.Count) last = Bars.Count - 1;
+
+            int pad = Math.Max(0, 表示範囲余裕本数);
+            first = Math.Max(0, first - pad);
+            last = Math.Min(Bars.Count - 1, last + pad);
+        }
+
+        private List<Pivot> BuildPivots(Bars bars, int rightBars, int? boundStart, int? boundEnd)
+        {
+            var pivots = new List<Pivot>(1024);
+            if (bars == null || bars.Count < 10) return pivots;
+
+            int endIndex = bars.Count - 1;
+
+            int startIndex;
+            int endBound;
+
+            if (boundStart.HasValue && boundEnd.HasValue && bars == Bars)
+            {
+                startIndex = boundStart.Value;
+                endBound = boundEnd.Value;
+            }
+            else
+            {
+                startIndex = Math.Max(0, bars.Count - 5000);
+                endBound = endIndex;
+            }
+
+            int maxCandidate = Math.Max(startIndex, endBound - Math.Max(0, rightBars));
+
+            double deviation = GetDeviationPrice(points);
+            double suppress = GetDeviationPrice(連続スイング抑制ポイント);
+
+            Pivot? last = null;
+
+            for (int i = startIndex + ZZ_Depth; i <= maxCandidate; i++)
+            {
+                bool isHigh = IsPivotHigh(bars, i, startIndex, maxCandidate, ZZ_Depth, rightBars, 同値右優先);
+                bool isLow = IsPivotLow(bars, i, startIndex, maxCandidate, ZZ_Depth, rightBars, 同値右優先);
+
+                if (isHigh && isLow)
+                {
+                    switch (同一足優先)
+                    {
+                        case 同一足優先モード.Highを優先:
+                            isLow = false; break;
+                        case 同一足優先モード.Lowを優先:
+                            isHigh = false; break;
+                        default:
+                            if (last.HasValue)
+                            {
+                                if (last.Value.Side == +1) isHigh = false;
+                                else isLow = false;
+                            }
+                            else
+                            {
+                                isLow = false;
+                            }
+                            break;
+                    }
+                }
+
+                if (isHigh)
+                {
+                    var c = new Pivot { Index = i, Time = bars.OpenTimes[i], Price = bars.HighPrices[i], Side = +1 };
+                    if (TryAcceptPivot(c, ref last, pivots, deviation, suppress, ZZ_Backstep))
+                        continue;
+                }
+
+                if (isLow)
+                {
+                    var c = new Pivot { Index = i, Time = bars.OpenTimes[i], Price = bars.LowPrices[i], Side = -1 };
+                    TryAcceptPivot(c, ref last, pivots, deviation, suppress, ZZ_Backstep);
+                }
+            }
+
+            return pivots;
+        }
+
+        private List<Pivot> ProjectToM5(List<Pivot> pivH1, int firstM5, int lastM5)
+        {
+            var proj = new List<Pivot>(pivH1.Count);
+            for (int i = 0; i < pivH1.Count; i++)
+            {
+                var p = pivH1[i];
+                int m5Index = -1;
+                try { m5Index = Bars.OpenTimes.GetIndexByTime(p.Time); } catch { }
+
+                if (m5Index < 0) continue;
+                if (m5Index < firstM5 || m5Index > lastM5) continue;
+
+                proj.Add(new Pivot
+                {
+                    Index = m5Index,
+                    Time = Bars.OpenTimes[m5Index],
+                    Price = p.Price,
+                    Side = p.Side
+                });
+            }
+            return proj;
+        }
+
+        private double GetDeviationPrice(double pts) => (pts <= 0) ? 0 : pts * Symbol.TickSize;
+
+        private static bool IsPivotHigh(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double h = bars.HighPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.HighPrices[k] > h) return false;
+                if (tieRight && k > i && bars.HighPrices[k] == h) return false;
+            }
+            return true;
+        }
+
+        private static bool IsPivotLow(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double l = bars.LowPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.LowPrices[k] < l) return false;
+                if (tieRight && k > i && bars.LowPrices[k] == l) return false;
+            }
+            return true;
+        }
+
+        private static bool TryAcceptPivot(Pivot candidate, ref Pivot? last, List<Pivot> pivots, double deviation, double suppress, int backstep)
+        {
+            if (suppress > 0 && last.HasValue)
+            {
+                if (Math.Abs(candidate.Price - last.Value.Price) < suppress)
+                    return false;
+            }
+
+            if (!last.HasValue)
+            {
+                pivots.Add(candidate);
+                last = candidate;
+                return true;
+            }
+
+            var prev = last.Value;
+
+            if (candidate.Side == prev.Side)
+            {
+                if (backstep > 0 && (candidate.Index - prev.Index) <= backstep)
+                {
+                    bool moreExtreme =
+                        (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                        (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                    if (moreExtreme)
+                    {
+                        pivots[pivots.Count - 1] = candidate;
+                        last = candidate;
+                        return true;
+                    }
+                    return false;
+                }
+
+                bool replace =
+                    (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                    (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                if (replace)
+                {
+                    pivots[pivots.Count - 1] = candidate;
+                    last = candidate;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (deviation > 0 && Math.Abs(candidate.Price - prev.Price) < deviation)
+                return false;
+
+            pivots.Add(candidate);
+            last = candidate;
+            return true;
+        }
+
+        private void DrawZigZagAndLabels(List<Pivot> pivots, Bars drawBars, Color lineColor, int width, LineStyle style, string labelPrefix)
+        {
+            if (pivots == null || pivots.Count < 2) return;
+
+            for (int i = 0; i < pivots.Count - 1; i++)
+            {
+                var a = pivots[i];
+                var b = pivots[i + 1];
+
+                string name = $"{Prefix}ZZ_{labelPrefix}_{a.Index}_{b.Index}_{i}";
+                Chart.DrawTrendLine(name, drawBars.OpenTimes[a.Index], a.Price, drawBars.OpenTimes[b.Index], b.Price, lineColor, width, style);
+                _names.Add(name);
+            }
+
+            if (!ラベル表示) return;
+
+            double? prevHigh = null;
+            double? prevLow = null;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                var p = pivots[i];
+
+                string txt;
+                Color txtColor;
+
+                if (p.Side == +1)
+                {
+                    if (prevHigh.HasValue)
+                    {
+                        if (p.Price > prevHigh.Value) { txt = "HH"; txtColor = Color.Lime; }
+                        else { txt = "LH"; txtColor = Color.Orange; }
+                    }
+                    else { txt = "H"; txtColor = Color.Orange; }
+
+                    prevHigh = p.Price;
+                }
+                else
+                {
+                    if (prevLow.HasValue)
+                    {
+                        if (p.Price > prevLow.Value) { txt = "HL"; txtColor = Color.Aqua; }
+                        else { txt = "LL"; txtColor = Color.Red; }
+                    }
+                    else { txt = "L"; txtColor = Color.Red; }
+
+                    prevLow = p.Price;
+                }
+
+                string swing = (p.Side == +1) ? "SwingHigh" : "SwingLow";
+                string full = $"{labelPrefix}{txt}  {swing}";
+
+                double y = p.Price;
+                double offset = Math.Max(0, ラベルYオフセットTick) * Symbol.TickSize;
+                y = (p.Side == +1) ? (y + offset) : (y - offset);
+
+                string name = $"{Prefix}TXT_{labelPrefix}_{p.Index}_{i}";
+                if (描画デバッグログ出力)
+                {
+                    try
+                    {
+                        var side = (p.Side == +1) ? "H" : "L";
+                        var drawTime = drawBars.OpenTimes[p.Index];
+                        Print($"DRAW {labelPrefix} idx={p.Index} pivotTime={p.Time:yyyy-MM-dd HH:mm} drawTime={drawTime:yyyy-MM-dd HH:mm} side={side} price={p.Price:F2} tag={txt} label=\"{full}\"");
+                    }
+                    catch { }
+                }
+                var t = Chart.DrawText(name, full, drawBars.OpenTimes[p.Index], y, txtColor);
+                t.FontSize = ラベル文字サイズ;
+                t.VerticalAlignment = VerticalAlignment.Center;
+                t.HorizontalAlignment = HorizontalAlignment.Center;
+                _names.Add(name);
+            }
+        }
+
+        private void ClearDrawings()
+        {
+            for (int i = 0; i < _names.Count; i++)
+            {
+                try { Chart.RemoveObject(_names[i]); } catch { }
+            }
+            _names.Clear();
+        }
+
+        private Color ParseColor(string s, Color fallback)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return fallback;
+            try { return Color.FromName(s.Trim()); }
+            catch { return fallback; }
+        }
+
+        // ===== Pivotログ（全Pivot出力）=====
+        private void LogPivotsIfNeeded_All(string tf, List<Pivot> pivots, Bars srcBars, ref string lastKey)
+        {
+            if (pivots == null || pivots.Count == 0 || srcBars == null || srcBars.Count == 0)
+                return;
+
+            // 重複抑止：先頭/末尾/件数が同じなら出さない
+            var first = pivots[0];
+            var last = pivots[pivots.Count - 1];
+            string key = $"{tf}|count={pivots.Count}|first={first.Index}|last={last.Index}|bars={srcBars.Count}";
+            if (key == lastKey) return;
+            lastKey = key;
+
+            Print($"[{Prefix}] PivotLog ON tf={tf} count={pivots.Count} firstIdx={first.Index} lastIdx={last.Index}");
+
+            double? prevHigh = null;
+            double? prevLow = null;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                var p = pivots[i];
+
+                int type = 0;
+                if (p.Side == +1)
+                {
+                    if (prevHigh.HasValue) type = (p.Price > prevHigh.Value) ? +2 : +1; // HH/LH
+                    prevHigh = p.Price;
+                }
+                else
+                {
+                    if (prevLow.HasValue) type = (p.Price > prevLow.Value) ? -1 : -2; // HL/LL
+                    prevLow = p.Price;
+                }
+
+                string side = (p.Side == +1) ? "H" : "L";
+                Print($"{tf} PIVOT idx={p.Index} t={p.Time:yyyy-MM-dd HH:mm} side={side} price={p.Price:F2} type={type} (HH=+2 LH=+1 HL=-1 LL=-2)");
+            }
+        }
+    }
+}

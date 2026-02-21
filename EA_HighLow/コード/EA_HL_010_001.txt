@@ -1,0 +1,505 @@
+// CODE NAME: EA_HL_010_001
+// ROLE:
+// - cTrader環境で「Robot から Custom Indicator 型を参照できない」構成でも必ずビルドできるテストBot
+// - HL_VIEW_010_001 と同一ロジックの Pivot 計算を Robot 内で実行し、ログ出力する（＝突合用）
+//
+// IMPORTANT:
+// - このBotは HL_VIEW_DATA_010_001 を一切参照しない（CS0246回避）
+// - チャート表示は HL_VIEW_010_001（Indicator）を別途チャートに適用して目視突合する
+//
+// SETUP:
+// 1) Indicators: HL_VIEW_010_001 をビルド & チャートに適用（表示用）
+// 2) Robots: 本ファイルだけをビルド
+// 3) M5チャートで本Botを起動 → Pivot確定時にログが出る
+//
+// NOTE:
+// - RightBars 固定：M5=1 / H1=2
+// - points_Fixed は TickSize 乗算（HL_VIEW_010_001と同じ）
+// - 同値右優先_Fixed / Backstep置換 / 連続スイング抑制 / 同一足優先_Fixed を同等実装
+
+using System;
+using System.Collections.Generic;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace EA_Dev.HighLow
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class EA_HL_010_001 : Robot
+    {
+        // ====== Params（HL_VIEW_010_001 と同値に合わせる） ======
+        public enum 同一足優先モード
+        {
+            前回スイングと逆を優先 = 0,
+            Highを優先 = 1,
+            Lowを優先 = 2
+        }
+
+        // ====== ロジック固定値（Parameter削除） ======
+        private const int ZZ_Depth_Fixed = 12;
+        private const double points_Fixed = 50; // Deviation（points）
+        private const int ZZ_Backstep_Fixed = 3;
+        private const double 連続スイング抑制ポイント_Fixed = 0;
+        private const bool 同値右優先_Fixed = true;
+        private const 同一足優先モード 同一足優先_Fixed = 同一足優先モード.前回スイングと逆を優先;
+
+        [Parameter("計算対象バー（軽量化）", Group = "最適化", DefaultValue = 3000, MinValue = 200)]
+        public int 計算対象バー { get; set; }
+
+        [Parameter("ログ：毎バー出す", Group = "デバッグ", DefaultValue = false)]
+        public bool 毎バー { get; set; }
+
+
+        // ====== 描画（EA内部Pivotをチャートへ可視化） ======
+        [Parameter("EA内部Pivot描画", Group = "描画", DefaultValue = true)]
+        public bool EA内部Pivot描画 { get; set; }
+
+        [Parameter("EA描画：M5表示", Group = "描画", DefaultValue = true)]
+        public bool EA描画_M5 { get; set; }
+
+        [Parameter("EA描画：H1表示", Group = "描画", DefaultValue = true)]
+        public bool EA描画_H1 { get; set; }
+
+        [Parameter("EA描画：ラベル表示", Group = "描画", DefaultValue = true)]
+        public bool EA描画_ラベル { get; set; }
+
+        [Parameter("EA描画：ラベル文字サイズ", Group = "描画", DefaultValue = 9, MinValue = 6, MaxValue = 30)]
+        public int EA描画_ラベル文字サイズ { get; set; }
+
+        [Parameter("EA描画：ラベルYオフセット（Tick）", Group = "描画", DefaultValue = 1, MinValue = 0, MaxValue = 5000)]
+        public int EA描画_ラベルYオフセットTick { get; set; }
+
+        [Parameter("EA描画：M5線色", Group = "描画", DefaultValue = "Red")]
+        public string EA描画_M5線色 { get; set; }
+
+        [Parameter("EA描画：M5線太さ", Group = "描画", DefaultValue = 1, MinValue = 1, MaxValue = 5)]
+        public int EA描画_M5線太さ { get; set; }
+
+        [Parameter("EA描画：H1線色", Group = "描画", DefaultValue = "White")]
+        public string EA描画_H1線色 { get; set; }
+
+        [Parameter("EA描画：H1線太さ", Group = "描画", DefaultValue = 1, MinValue = 1, MaxValue = 5)]
+        public int EA描画_H1線太さ { get; set; }
+        // ====== internal ======
+        private const int RightBars_M5 = 1;
+        private const int RightBars_H1 = 2;
+
+
+        private string _drawInstanceId = "";
+        private readonly List<string> _drawNames = new List<string>(8000);
+        private Bars _h1;
+
+        private int _lastBuiltM5Count = -1;
+        private int _lastBuiltH1Count = -1;
+
+        private List<Pivot> _m5Pivots = new List<Pivot>(1024);
+        private List<Pivot> _h1Pivots = new List<Pivot>(1024);
+
+        private int _lastLogPivotM5Index = -1;
+        private int _lastLogPivotH1Index = -1;
+
+        private struct Pivot
+        {
+            public int Index;       // native TF index
+            public DateTime Time;
+            public double Price;
+            public int Side;        // +1 high, -1 low
+        }
+
+        protected override void OnStart()
+        {
+            _h1 = MarketData.GetBars(TimeFrame.Hour);
+            _drawInstanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+            Print($"EA_HL_010_001 started. inst={_drawInstanceId} (Robot内計算版 / Indicator参照なし)");
+
+            // 休場中などでバー更新が無い場合でも、起動直後に1回だけ計算→描画する
+            try
+            {
+                if (Bars != null && Bars.Count >= 10)
+                {
+                    _m5Pivots = BuildPivots(Bars, RightBars_M5, 計算対象バー);
+                }
+                else
+                {
+                    _m5Pivots = new List<Pivot>();
+                }
+
+                if (_h1 != null && _h1.Count >= 10)
+                {
+                    _h1Pivots = BuildPivots(_h1, RightBars_H1, Math.Max(5000, 計算対象バー));
+                }
+                else
+                {
+                    _h1Pivots = new List<Pivot>();
+                }
+
+                // 起動直後の最新Pivotもログに出す（必要ならオフにする）
+                LogLastPivot("M5", _m5Pivots, ref _lastLogPivotM5Index);
+                LogLastPivot("H1", _h1Pivots, ref _lastLogPivotH1Index);
+
+                if (EA内部Pivot描画)
+                    RedrawEAPivots();
+            }
+            catch (Exception ex)
+            {
+                Print("EA INIT ERROR: " + ex.Message);
+            }
+        }
+
+        
+        protected override void OnStop()
+        {
+            ClearEADrawings();
+        }
+
+protected override void OnBar()
+        {
+            // M5チャートでの確定バーは Bars.Count-2
+            int confirmed = Bars.Count - 2;
+            if (confirmed < 0) return;
+
+            // 毎バー or 新規バーでだけ再計算（軽量化）
+            if (!毎バー)
+            {
+                if (Bars.Count == _lastBuiltM5Count && (_h1?.Count ?? 0) == _lastBuiltH1Count)
+                    return;
+            }
+
+            _lastBuiltM5Count = Bars.Count;
+            _lastBuiltH1Count = _h1?.Count ?? 0;
+
+            _m5Pivots = BuildPivots(Bars, RightBars_M5, 計算対象バー);
+            _h1Pivots = (_h1 == null) ? new List<Pivot>() : BuildPivots(_h1, RightBars_H1, Math.Max(5000, 計算対象バー));
+
+            // 最新Pivotをログ（M5/H1）
+            LogLastPivot("M5", _m5Pivots, ref _lastLogPivotM5Index);
+            LogLastPivot("H1", _h1Pivots, ref _lastLogPivotH1Index);
+
+            if (EA内部Pivot描画)
+                RedrawEAPivots();
+        }
+
+        private void LogLastPivot(string tag, List<Pivot> pivots, ref int lastLoggedPivotIndex)
+        {
+            if (pivots == null || pivots.Count == 0) return;
+
+            var last = pivots[pivots.Count - 1];
+            if (last.Index == lastLoggedPivotIndex) return;
+            lastLoggedPivotIndex = last.Index;
+
+            // HH/LH/HL/LL 判定（同一TFのpivot列に対して）
+            int type = ComputeLastPivotType(pivots);
+
+            Print($"{tag} PIVOT idx={last.Index} t={last.Time:yyyy-MM-dd HH:mm} side={(last.Side==+1?"H":"L")} price={last.Price} type={type} (HH=+2 LH=+1 HL=-1 LL=-2)");
+        }
+
+        private int ComputeLastPivotType(List<Pivot> pivots)
+        {
+            double? prevHigh = null;
+            double? prevLow = null;
+            int lastType = 0;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                var p = pivots[i];
+
+                if (p.Side == +1)
+                {
+                    if (prevHigh.HasValue) lastType = (p.Price > prevHigh.Value) ? +2 : +1;
+                    prevHigh = p.Price;
+                }
+                else
+                {
+                    if (prevLow.HasValue) lastType = (p.Price > prevLow.Value) ? -1 : -2;
+                    prevLow = p.Price;
+                }
+            }
+            return lastType;
+        }
+
+        private List<Pivot> BuildPivots(Bars bars, int rightBars, int maxBars)
+        {
+            var pivots = new List<Pivot>(1024);
+            if (bars == null || bars.Count < 10) return pivots;
+
+            int endIndex = bars.Count - 1;
+            int startIndex = 0; // Phase1整合: 履歴カット禁止（Pivot系列文脈を維持）
+int maxCandidate = Math.Max(startIndex, endIndex - Math.Max(0, rightBars));
+
+            double deviation = GetDeviationPrice(points_Fixed);
+            double suppress = GetDeviationPrice(連続スイング抑制ポイント_Fixed);
+
+            Pivot? last = null;
+
+            for (int i = startIndex + ZZ_Depth_Fixed; i <= maxCandidate; i++)
+            {
+                bool isHigh = IsPivotHigh(bars, i, startIndex, maxCandidate, ZZ_Depth_Fixed, rightBars, 同値右優先_Fixed);
+                bool isLow = IsPivotLow(bars, i, startIndex, maxCandidate, ZZ_Depth_Fixed, rightBars, 同値右優先_Fixed);
+
+                if (isHigh && isLow)
+                {
+                    switch (同一足優先_Fixed)
+                    {
+                        case 同一足優先モード.Highを優先:
+                            isLow = false; break;
+                        case 同一足優先モード.Lowを優先:
+                            isHigh = false; break;
+                        default:
+                            if (last.HasValue)
+                            {
+                                if (last.Value.Side == +1) isHigh = false;
+                                else isLow = false;
+                            }
+                            else
+                            {
+                                isLow = false; // first: High wins
+                            }
+                            break;
+                    }
+                }
+
+                if (isHigh)
+                {
+                    var c = new Pivot { Index = i, Time = bars.OpenTimes[i], Price = bars.HighPrices[i], Side = +1 };
+                    if (TryAcceptPivot(c, ref last, pivots, deviation, suppress, ZZ_Backstep_Fixed))
+                        continue;
+                }
+
+                if (isLow)
+                {
+                    var c = new Pivot { Index = i, Time = bars.OpenTimes[i], Price = bars.LowPrices[i], Side = -1 };
+                    TryAcceptPivot(c, ref last, pivots, deviation, suppress, ZZ_Backstep_Fixed);
+                }
+            }
+
+            return pivots;
+        }
+
+        private double GetDeviationPrice(double pts) => (pts <= 0) ? 0 : pts * Symbol.TickSize;
+
+        private static bool IsPivotHigh(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double h = bars.HighPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.HighPrices[k] > h) return false;
+                if (tieRight && k > i && bars.HighPrices[k] == h) return false;
+            }
+            return true;
+        }
+
+        private static bool IsPivotLow(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double l = bars.LowPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i) continue;
+                if (bars.LowPrices[k] < l) return false;
+                if (tieRight && k > i && bars.LowPrices[k] == l) return false;
+            }
+            return true;
+        }
+
+        private static bool TryAcceptPivot(Pivot candidate, ref Pivot? last, List<Pivot> pivots, double deviation, double suppress, int backstep)
+        {
+            if (suppress > 0 && last.HasValue)
+            {
+                if (Math.Abs(candidate.Price - last.Value.Price) < suppress)
+                    return false;
+            }
+
+            if (!last.HasValue)
+            {
+                pivots.Add(candidate);
+                last = candidate;
+                return true;
+            }
+
+            var prev = last.Value;
+
+            if (candidate.Side == prev.Side)
+            {
+                if (backstep > 0 && (candidate.Index - prev.Index) <= backstep)
+                {
+                    bool moreExtreme =
+                        (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                        (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                    if (moreExtreme)
+                    {
+                        pivots[pivots.Count - 1] = candidate;
+                        last = candidate;
+                        return true;
+                    }
+                    return false;
+                }
+
+                bool replace =
+                    (candidate.Side == +1 && candidate.Price >= prev.Price) ||
+                    (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                if (replace)
+                {
+                    pivots[pivots.Count - 1] = candidate;
+                    last = candidate;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (deviation > 0 && Math.Abs(candidate.Price - prev.Price) < deviation)
+                return false;
+
+            pivots.Add(candidate);
+            last = candidate;
+            return true;
+        }
+        // ====== EA描画 ======
+
+        private void RedrawEAPivots()
+        {
+            if (Chart == null)
+            {
+                Print("EA DRAW: Chart is null (ロボットがチャートにアタッチされていない可能性). 描画はスキップ.");
+                return;
+            }
+
+            // cTraderは描画APIがUIスレッド前提のことがあるため、必ずメインスレッドで実行
+            BeginInvokeOnMainThread(() =>
+            {
+                try
+                {
+                    ClearEADrawings();
+
+                    if (EA描画_M5 && _m5Pivots != null && _m5Pivots.Count >= 2)
+                    {
+                        var c = ParseColor(EA描画_M5線色, Color.Yellow);
+                        DrawZigZagAndLabels("M5", _m5Pivots, Bars, c, EA描画_M5線太さ, labelPrefix: "");
+                    }
+
+                    if (EA描画_H1 && _h1Pivots != null && _h1Pivots.Count >= 2 && _h1 != null)
+                    {
+                        var proj = ProjectToM5(_h1Pivots);
+                        if (proj.Count >= 2)
+                        {
+                            var c = ParseColor(EA描画_H1線色, Color.Aqua);
+                            DrawZigZagAndLabels("H1", proj, Bars, c, EA描画_H1線太さ, labelPrefix: "");
+                        }
+                    }
+
+                    // 可視確認用：描画が走ったことを1行だけ出す（大量にならないよう毎バーは出さない）
+                    // 必要なら毎バー出力パラメータ（毎バー）と連動させても良い
+                }
+                catch (Exception ex)
+                {
+                    Print("EA DRAW ERROR: " + ex.Message);
+                }
+            });
+        }
+
+        private void ClearEADrawings()
+        {
+            for (int i = 0; i < _drawNames.Count; i++)
+            {
+                try { Chart.RemoveObject(_drawNames[i]); } catch { }
+            }
+            _drawNames.Clear();
+        }
+
+        private List<Pivot> ProjectToM5(List<Pivot> pivH1)
+        {
+            var proj = new List<Pivot>(pivH1.Count);
+            for (int i = 0; i < pivH1.Count; i++)
+            {
+                var p = pivH1[i];
+                int m5Index = -1;
+                try { m5Index = Bars.OpenTimes.GetIndexByTime(p.Time); } catch { }
+
+                if (m5Index < 0) continue;
+
+                proj.Add(new Pivot
+                {
+                    Index = m5Index,
+                    Time = Bars.OpenTimes[m5Index],
+                    Price = p.Price,
+                    Side = p.Side
+                });
+            }
+            return proj;
+        }
+
+        private void DrawZigZagAndLabels(string tf, List<Pivot> pivots, Bars drawBars, Color lineColor, int width, string labelPrefix)
+        {
+            // ZigZag line
+            for (int i = 0; i < pivots.Count - 1; i++)
+            {
+                var a = pivots[i];
+                var b = pivots[i + 1];
+
+                string name = $"EAHL_{_drawInstanceId}_{tf}_ZZ_{a.Index}_{b.Index}_{i}";
+                Chart.DrawTrendLine(name, drawBars.OpenTimes[a.Index], a.Price, drawBars.OpenTimes[b.Index], b.Price, lineColor, width, LineStyle.Solid);
+                _drawNames.Add(name);
+            }
+
+            if (!EA描画_ラベル) return;
+
+            double? prevHigh = null;
+            double? prevLow = null;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                var p = pivots[i];
+
+                string txt;
+                if (p.Side == +1)
+                {
+                    if (prevHigh.HasValue) txt = (p.Price > prevHigh.Value) ? "HH" : "LH";
+                    else txt = "H";
+                    prevHigh = p.Price;
+                }
+                else
+                {
+                    if (prevLow.HasValue) txt = (p.Price > prevLow.Value) ? "HL" : "LL";
+                    else txt = "L";
+                    prevLow = p.Price;
+                }
+
+                Color txtColor;
+                if (txt == "HH") txtColor = Color.Lime;
+                else if (txt == "LH") txtColor = Color.Orange;
+                else if (txt == "HL") txtColor = Color.Aqua;
+                else if (txt == "LL") txtColor = Color.Red;
+                else txtColor = Color.Gray;
+
+                string swing = (p.Side == +1) ? "SwingHigh" : "SwingLow";
+                string full = $"{txt} {swing}";
+                double y = p.Price;
+                double offset = Math.Max(0, EA描画_ラベルYオフセットTick) * Symbol.TickSize;
+                y = (p.Side == +1) ? (y + offset) : (y - offset);
+
+                string name = $"EAHL_{_drawInstanceId}_{tf}_TXT_{p.Index}_{i}";
+                var t = Chart.DrawText(name, full, drawBars.OpenTimes[p.Index], y, txtColor);
+                t.FontSize = EA描画_ラベル文字サイズ;
+                t.VerticalAlignment = VerticalAlignment.Center;
+                t.HorizontalAlignment = HorizontalAlignment.Center;
+                _drawNames.Add(name);
+            }
+        }
+
+        private Color ParseColor(string s, Color fallback)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return fallback;
+            try { return Color.FromName(s.Trim()); }
+            catch { return fallback; }
+        }
+
+    }
+}

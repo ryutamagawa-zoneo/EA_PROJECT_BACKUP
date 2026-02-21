@@ -1,0 +1,586 @@
+# 経済指標モジュール（単体保全用テキスト）
+# 作成元（参考）：EMA_M5_ALL_DAY_018_019_XAUUSD_M5
+# 目的：
+#   - 今後、別部屋/別EAへ「経済指標フィルター」だけを安全に移植できるようにする
+#   - 事故耐性（例外でEA全体が壊れない）と、バックテスト/フォワード分離を維持する
+#
+# 重要：これは「フルコード」ではありません（移植用モジュール断片＋運用手順）。
+#
+# ============================================================
+# 0) このモジュールの責務（絶対）
+# ============================================================
+# - 経済指標の「発表予定時刻」だけを扱う（数値は不要）
+# - Backtest/Forward を 2スイッチで厳密に分離（矛盾ON/ONはEA停止）
+# - OFF/OFF はニュース無効（副作用ゼロ：ファイルI/Oなし、HTTPなし、日次更新なし）
+# - 失敗時はEAを止めない（フォワード：当日新規停止＝SAFE MODE）
+# - バックテストは高速最優先：API通信を絶対に行わない
+#
+# ============================================================
+# 1) 移植の手順（迷わないための固定手順）
+# ============================================================
+# 手順A：コード配置
+# 1) 対象EAのRobotクラス「内部」に、このモジュールブロックをそのまま貼り付ける
+#    - 既存の同種ニュース機能（旧EnableNewsFilter/旧Hardcoded2025等）は二重管理事故になるので削除/無効化する
+# 2) Parameterグループの並び：
+#    - 「経済指標フィルター（UTC）」は「取引時間帯（JST）」の直上
+#
+# 手順B：呼び出し点（触るのは最小）
+# 3) OnStart() の終盤（初期化完了後）でニュース初期化を1回呼ぶ
+# 4) タイマー（OnTimer）または OnBar で、UTC日替り時にニュース更新を呼ぶ
+#    - フォワードのみ（Backtestは更新不要）
+# 5) 「新規エントリー直前」1箇所だけにゲートを挿入する（それ以外触らない）
+#    例：
+#       if (!IsNewEntryAllowed(nowUtc, out var reason)) { Print(reason); return; }
+#
+# 手順C：最重要の事故防止
+# 6) 例外はEA全体へ伝播させない：
+#    - ニュース初期化/更新は必ず try/catch（モジュール内で完結）し、失敗時はSAFE MODEへ落とす
+# 7) Print/string.Format の引数ズレはOnStartクラッシュの原因になるため禁止
+#
+# ============================================================
+# 2) パラメータ（日本語表示名：固定）
+# ============================================================
+# 【経済指標フィルター（UTC）】
+# - バックテスト用（2025固定データを使用） : bool
+# - フォワード用（FRED APIで取得）           : bool
+# - FRED APIキー                              : string
+# - 指標前の停止時間（分）                    : int
+# - 指標後の再開時間（分）                    : int
+#
+# スイッチ挙動（厳密）
+#   Backtest=ON / Forward=OFF → 2025固定（API禁止）
+#   Backtest=OFF / Forward=ON → FRED API
+#   Backtest=ON / Forward=ON  → EA停止（設定矛盾）
+#   Backtest=OFF / Forward=OFF→ ニュース無効（ログ明示）
+#
+# ============================================================
+# 3) FRED Release ID（固定セット）
+# ============================================================
+# - NFP（Employment Situation） : rid=50
+# - CPI（Consumer Price Index） : rid=10
+# - PCE（Personal Income and Outlays）: rid=54
+# - FOMC（FOMC Press Release）  : rid=101
+#
+# ============================================================
+# 4) 期待ログ（最低限）
+# ============================================================
+# - NEWS_MODE / NEWS_SOURCE / NEWS_BLOCK / NEWS_SAFE_MODE が出ること
+# - OFF/OFF で副作用ゼロ（HTTP/ファイルアクセスが発生しない）こと
+#
+# ============================================================
+# 5) 回帰テスト（必須）
+# ============================================================
+# 1) OFF/OFF（Backtest=OFF, Forward=OFF）
+#    - 移植前のEAと「取引回数/損益傾向」が一致すること（ニュースは完全に無関与）
+# 2) BacktestのみON
+#    - API通信が発生しないこと（速度劣化なし）
+#    - NEWS_BLOCKが該当時刻でだけ出ること
+# 3) ForwardのみON
+#    - 起動時＋UTC日替りでのみ取得されること
+#    - 取得失敗時はSAFE MODE（当日新規停止）になること
+#
+# ============================================================
+# 6) “触ってはいけない”箇所（事故再発防止）
+# ============================================================
+# - 価格/SL/TP/EMA/時間帯/ロット/スリッページの計算式
+# - それらに関する変数の初期化順
+# - エントリー条件式そのもの
+#
+# 触ってよいのは「新規エントリー直前のreturn判定」と、ニュースモジュール内部だけ。
+#
+# ============================================================
+# 7) モジュール本体（貼り付け用）
+# ============================================================
+
+        // ===== NEWS MODULE START =====================================
+        // 経済指標フィルター（UTC）  ※移植可能ユニット
+        // 外部公開は IsNewEntryAllowed() のみ
+        // ============================================================
+
+        // FRED Release IDs (fixed set)
+        private const int FRED_RID_NFP = 50;   // Employment Situation
+        private const int FRED_RID_CPI = 10;   // Consumer Price Index
+        private const int FRED_RID_PCE = 54;   // Personal Income and Outlays (PCE/PCEPI etc.)
+        private const int FRED_RID_FOMC = 101; // FOMC Press Release
+
+        private List<DateTime> _newsEventsUtc = new List<DateTime>();
+        private DateTime _newsLoadedUtcDate = DateTime.MinValue;
+        private bool _newsBacktestLoaded = false;
+
+        private bool _newsSafeMode = false;
+        private DateTime _newsSafeUtcDate = DateTime.MinValue;
+        private string _newsSafeReason = "";
+
+        private TimeZoneInfo _easternTz;
+
+        private void News_InitOrRefresh(DateTime utcNow, bool force = false)
+        {
+            // mode conflict
+            if (UseNewsBacktest2025 && UseNewsForwardFRED)
+            {
+                Print("NEWS_FATAL | CodeName={0} | Symbol={1} | Action=STOP | Reason=MODE_CONFLICT (Backtest=ON & Forward=ON){2}",
+                    CODE_NAME, SymbolName, BuildTimeTag(utcNow));
+                Stop();
+                return;
+            }
+
+            // disabled
+            if (!UseNewsBacktest2025 && !UseNewsForwardFRED)
+            {
+                //副作用ゼロ：何もしない（イベントも空でOK）
+                _newsEventsUtc.Clear();
+                _newsSafeMode = false;
+                return;
+            }
+
+            // Backtest mode: load once
+            if (UseNewsBacktest2025)
+            {
+                if (_newsBacktestLoaded && !force)
+                    return;
+
+                _newsEventsUtc = LoadBacktestCalendarOrFallback(out string source, out string detail);
+                _newsBacktestLoaded = true;
+                _newsLoadedUtcDate = utcNow.Date;
+
+                Print("NEWS_SOURCE | CodeName={0} | Symbol={1} | Mode=BACKTEST_2025 | Source={2} | Detail={3}{4}",
+                    CODE_NAME, SymbolName, source, detail, BuildTimeTag(utcNow));
+
+                _newsSafeMode = false;
+                return;
+            }
+
+            // Forward mode: refresh on UTC date change (or force)
+            DateTime todayUtc = utcNow.Date;
+            if (!force && _newsLoadedUtcDate.Date == todayUtc)
+                return;
+
+            _easternTz = _easternTz ?? ResolveEasternTimeZone();
+            if (_easternTz == null)
+            {
+                // cannot resolve eastern tz -> SAFE MODE
+                _newsSafeMode = true;
+                _newsSafeUtcDate = todayUtc;
+                _newsSafeReason = "EASTERN_TZ_NOT_FOUND";
+                _newsEventsUtc.Clear();
+
+                Print("NEWS_SAFE_MODE | CodeName={0} | Symbol={1} | Reason={2}{3}",
+                    CODE_NAME, SymbolName, _newsSafeReason, BuildTimeTag(utcNow));
+                _newsLoadedUtcDate = todayUtc;
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(FredApiKey))
+            {
+                _newsSafeMode = true;
+                _newsSafeUtcDate = todayUtc;
+                _newsSafeReason = "APIKEY_EMPTY";
+                _newsEventsUtc.Clear();
+
+                Print("NEWS_SAFE_MODE | CodeName={0} | Symbol={1} | Reason={2}{3}",
+                    CODE_NAME, SymbolName, _newsSafeReason, BuildTimeTag(utcNow));
+                _newsLoadedUtcDate = todayUtc;
+                return;
+            }
+
+            if (!TryLoadFredEventsForDate(todayUtc, out List<DateTime> eventsUtc, out string err))
+            {
+                _newsSafeMode = true;
+                _newsSafeUtcDate = todayUtc;
+                _newsSafeReason = "FRED_FAIL:" + (string.IsNullOrWhiteSpace(err) ? "NA" : err);
+                _newsEventsUtc.Clear();
+
+                Print("NEWS_SAFE_MODE | CodeName={0} | Symbol={1} | Reason={2}{3}",
+                    CODE_NAME, SymbolName, _newsSafeReason, BuildTimeTag(utcNow));
+                _newsLoadedUtcDate = todayUtc;
+                return;
+            }
+
+            _newsEventsUtc = eventsUtc ?? new List<DateTime>();
+            _newsLoadedUtcDate = todayUtc;
+            _newsSafeMode = false;
+
+            Print("NEWS_SOURCE | CodeName={0} | Symbol={1} | Mode=FORWARD_FRED | Events={2}{3}",
+                CODE_NAME, SymbolName, _newsEventsUtc.Count, BuildTimeTag(utcNow));
+        }
+
+        // 外部公開：新規エントリー可否（ニュースのみ）
+        private bool IsNewEntryAllowed(DateTime utcNow, out string blockReason)
+        {
+            blockReason = "OK";
+
+            // disabled
+            if (!UseNewsBacktest2025 && !UseNewsForwardFRED)
+                return true;
+
+            // conflict handled by init (Stop), but keep guard
+            if (UseNewsBacktest2025 && UseNewsForwardFRED)
+            {
+                blockReason = "MODE_CONFLICT";
+                return false;
+            }
+
+            // SAFE MODE: block new entries for the day
+            if (_newsSafeMode && _newsSafeUtcDate.Date == utcNow.Date)
+            {
+                blockReason = "SAFE_MODE:" + (string.IsNullOrWhiteSpace(_newsSafeReason) ? "NA" : _newsSafeReason);
+                return false;
+            }
+
+            if (_newsEventsUtc == null || _newsEventsUtc.Count == 0)
+                return true;
+
+            int before = Math.Max(0, MinutesBeforeNews);
+            int after = Math.Max(0, MinutesAfterNews);
+
+            for (int i = 0; i < _newsEventsUtc.Count; i++)
+            {
+                DateTime e = _newsEventsUtc[i];
+                DateTime start = e.AddMinutes(-before);
+                DateTime end = e.AddMinutes(after);
+
+                if (utcNow >= start && utcNow <= end)
+                {
+                    blockReason = "NEWS_WINDOW";
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private List<DateTime> LoadBacktestCalendarOrFallback(out string source, out string detail)
+        {
+            source = "NA";
+            detail = "NA";
+
+            try
+            {
+                // 1) algo directory relative file (preferred)
+                if (TryReadCalendarTextFromPath(CalendarFileName(), out string txt, out string usedPath))
+                {
+                    List<DateTime> ev = ParseEconomicCalendarCsvToUtcList(txt, out int total, out int kept);
+                    source = "FILE";
+                    detail = usedPath + $" | Total={total} Kept={kept}";
+                    return ev;
+                }
+            }
+            catch
+            {
+                // ignore; fallback below
+            }
+
+            // fallback: built-in minimal set for 2025 (NFP/CPI/FOMC)
+            source = "FALLBACK";
+            detail = "BUILTIN_2025_MIN";
+            return ParseEconomicCalendarCsvToUtcList(BUILTIN_2025_CALENDAR_CSV, out _, out _);
+        }
+
+        private string CalendarFileName()
+        {
+            // fixed name for now (keeps behavior stable)
+            return "EconomicCalendar.txt";
+        }
+
+        private bool TryReadCalendarTextFromPath(string fileName, out string text, out string usedPath)
+        {
+            text = null;
+            usedPath = "NA";
+
+            // Try relative (algo directory)
+            try
+            {
+                string t = File.ReadAllText(fileName);
+                text = t;
+                usedPath = "ALGO_DIR:" + fileName;
+                return true;
+            }
+            catch
+            {
+                // continue
+            }
+
+            // Try common documents locations
+            string doc = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            if (!string.IsNullOrWhiteSpace(doc))
+            {
+                string[] candidates = new string[]
+                {
+                    Path.Combine(doc, "cAlgo", "Data", "cBots", GetType().Name, fileName),
+                    Path.Combine(doc, "cAlgo", "Data", "cBots", fileName),
+                    Path.Combine(doc, "cAlgo", "Data", fileName),
+                    Path.Combine(doc, "cAlgo", fileName),
+                    Path.Combine(doc, "cTrader", "Data", "cBots", GetType().Name, fileName),
+                    Path.Combine(doc, fileName)
+                };
+
+                for (int i = 0; i < candidates.Length; i++)
+                {
+                    try
+                    {
+                        if (File.Exists(candidates[i]))
+                        {
+                            text = File.ReadAllText(candidates[i]);
+                            usedPath = candidates[i];
+                            return true;
+                        }
+                    }
+                    catch
+                    {
+                        // continue
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private List<DateTime> ParseEconomicCalendarCsvToUtcList(string csv, out int totalLines, out int keptLines)
+        {
+            totalLines = 0;
+            keptLines = 0;
+
+            List<DateTime> list = new List<DateTime>();
+            if (string.IsNullOrWhiteSpace(csv))
+                return list;
+
+            string[] lines = csv.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                // header line skip
+                if (line.StartsWith("Date", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                totalLines++;
+
+                // CSV: datetime,event,importance (event may contain commas in rare cases; keep simple)
+                string[] parts = line.Split(',');
+                if (parts.Length < 2)
+                    continue;
+
+                string dtStr = parts[0].Trim();
+                string eventStr = parts[1].Trim();
+                string impStr = (parts.Length >= 3 ? parts[2].Trim() : "");
+
+                if (!IsHighImportance(impStr))
+                    continue;
+
+                if (!IsTargetBacktestEvent(eventStr))
+                    continue;
+
+                if (!TryParseUtcDateTime(dtStr, out DateTime utc))
+                    continue;
+
+                if (utc.Year != 2025)
+                    continue;
+
+                list.Add(utc);
+                keptLines++;
+            }
+
+            list.Sort();
+            return list;
+        }
+
+        private bool IsHighImportance(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return true; // allow if missing
+
+            return s.IndexOf("High", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsTargetBacktestEvent(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+
+            string u = s.ToUpperInvariant();
+            if (u.Contains("NON-FARM") || u.Contains("NFP"))
+                return true;
+            if (u.Contains("CPI"))
+                return true;
+            if (u.Contains("FOMC"))
+                return true;
+
+            return false;
+        }
+
+        private bool TryParseUtcDateTime(string s, out DateTime utc)
+        {
+            utc = DateTime.MinValue;
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+
+            // Accept "yyyy-MM-dd HH:mm:ss"
+            if (!DateTime.TryParseExact(s.Trim(), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTime dt))
+                return false;
+
+            utc = DateTime.SpecifyKind(dt, DateTimeKind.Utc);
+            return true;
+        }
+
+        private bool TryLoadFredEventsForDate(DateTime utcDate, out List<DateTime> eventsUtc, out string error)
+        {
+            eventsUtc = new List<DateTime>();
+            error = "";
+
+            string dateStr = utcDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+            int[] rids = new int[] { FRED_RID_NFP, FRED_RID_CPI, FRED_RID_PCE, FRED_RID_FOMC };
+            for (int i = 0; i < rids.Length; i++)
+            {
+                if (!TryFredHasReleaseOnDate(rids[i], dateStr, out bool hasRelease, out string err))
+                {
+                    error = err;
+                    return false;
+                }
+                if (!hasRelease)
+                    continue;
+
+                DateTime eUtc = GetDefaultReleaseTimeUtcFromRid(utcDate, rids[i]);
+                eventsUtc.Add(eUtc);
+            }
+
+            eventsUtc.Sort();
+            return true;
+        }
+
+        private bool TryFredHasReleaseOnDate(int rid, string dateStr, out bool hasRelease, out string error)
+        {
+            hasRelease = false;
+            error = "";
+
+            try
+            {
+                string url =
+                    "https://api.stlouisfed.org/fred/release/dates" +
+                    "?release_id=" + rid.ToString(CultureInfo.InvariantCulture) +
+                    "&realtime_start=" + dateStr +
+                    "&realtime_end=" + dateStr +
+                    "&api_key=" + Uri.EscapeDataString(FredApiKey ?? "") +
+                    "&file_type=json";
+
+                var resp = Http.Get(url);
+                if (resp == null)
+                {
+                    error = "NULL_RESPONSE";
+                    return false;
+                }
+                if (!resp.IsSuccessful)
+                {
+                    error = "HTTP_" + resp.StatusCode.ToString(CultureInfo.InvariantCulture);
+                    return false;
+                }
+                string res = resp.Body;
+                if (string.IsNullOrWhiteSpace(res))
+                {
+                    error = "EMPTY_RESPONSE";
+                    return false;
+                }
+
+                // minimal JSON parse: look for "date":"YYYY-MM-DD"
+                // If any match equals dateStr -> release exists
+                int idx = 0;
+                while (true)
+                {
+                    int p = res.IndexOf("\"date\"", idx, StringComparison.OrdinalIgnoreCase);
+                    if (p < 0) break;
+                    int q = res.IndexOf(":", p);
+                    if (q < 0) break;
+                    int s = res.IndexOf("\"", q + 1);
+                    if (s < 0) break;
+                    int e = res.IndexOf("\"", s + 1);
+                    if (e < 0) break;
+                    string d = res.Substring(s + 1, e - s - 1);
+                    if (d == dateStr)
+                    {
+                        hasRelease = true;
+                        return true;
+                    }
+                    idx = e + 1;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.GetType().Name;
+                return false;
+            }
+        }
+
+        private DateTime GetDefaultReleaseTimeUtcFromRid(DateTime utcDate, int rid)
+        {
+            // Use US/Eastern time with DST handling
+            int hour = 8;
+            int minute = 30;
+
+            if (rid == FRED_RID_FOMC)
+            {
+                hour = 14;
+                minute = 0;
+            }
+
+            DateTime easternLocal = new DateTime(utcDate.Year, utcDate.Month, utcDate.Day, hour, minute, 0, DateTimeKind.Unspecified);
+            DateTime utc = TimeZoneInfo.ConvertTimeToUtc(easternLocal, _easternTz);
+            return DateTime.SpecifyKind(utc, DateTimeKind.Utc);
+        }
+
+        private TimeZoneInfo ResolveEasternTimeZone()
+        {
+            try
+            {
+                // Windows
+                return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // Built-in calendar (CSV) for 2025 minimal set: DateTime(UTC),Event,Importance
+        // NOTE: Used only when EconomicCalendar.txt cannot be found/read in Backtest mode.
+        private const string BUILTIN_2025_CALENDAR_CSV = @"
+DateTime,Event,Importance
+2025-01-10 13:30:00,Non-Farm Payrolls,High
+2025-01-15 13:30:00,CPI m/m,High
+2025-01-29 19:00:00,FOMC Statement,High
+2025-02-07 13:30:00,Non-Farm Payrolls,High
+2025-02-12 13:30:00,CPI m/m,High
+2025-03-07 13:30:00,Non-Farm Payrolls,High
+2025-03-12 12:30:00,CPI m/m,High
+2025-03-19 18:00:00,FOMC Statement,High
+2025-04-04 12:30:00,Non-Farm Payrolls,High
+2025-04-10 12:30:00,CPI m/m,High
+2025-05-02 12:30:00,Non-Farm Payrolls,High
+2025-05-14 12:30:00,CPI m/m,High
+2025-06-06 12:30:00,Non-Farm Payrolls,High
+2025-06-11 12:30:00,CPI m/m,High
+2025-06-18 18:00:00,FOMC Statement,High
+2025-07-04 12:30:00,Non-Farm Payrolls,High
+2025-07-10 12:30:00,CPI m/m,High
+2025-07-30 18:00:00,FOMC Statement,High
+2025-08-01 12:30:00,Non-Farm Payrolls,High
+2025-08-13 12:30:00,CPI m/m,High
+2025-09-05 12:30:00,Non-Farm Payrolls,High
+2025-09-10 12:30:00,CPI m/m,High
+2025-09-17 18:00:00,FOMC Statement,High
+2025-10-03 12:30:00,Non-Farm Payrolls,High
+2025-10-15 12:30:00,CPI m/m,High
+2025-10-29 18:00:00,FOMC Statement,High
+2025-11-07 13:30:00,Non-Farm Payrolls,High
+2025-11-12 13:30:00,CPI m/m,High
+2025-12-05 13:30:00,Non-Farm Payrolls,High
+2025-12-10 13:30:00,CPI m/m,High
+2025-12-17 19:00:00,FOMC Statement,High
+";
+
+        // ============================================================
+        // ===== NEWS MODULE END =======================================

@@ -1,0 +1,156 @@
+入口判定の最上位分岐（OnBar内）
+
+OnBar() の最後の方で、Framework（COREMODE系） か EMA かを分岐しています（この形が入口の最上位ルートです）。
+
+Framework ルートに入る条件
+IsCOREModeEnabled() && (EnableCOREMode || IsEntryModeCORE())
+→ TryEntryFramework(utcNow, useFixedExit: EnableCOREMode); return;
+
+それ以外
+→ TryEmaEntry();
+
+EMAルートの入口判定（TryEmaEntry）— 評価順序そのまま
+
+以下が **TryEmaEntry() の「入口判定」**です。順序はコード順＝評価順です（ここがズレると失敗条件に該当）。
+
+0) 前提チェック
+
+EMAインジが無い / バー不足なら return
+
+参照は確定足のみ：
+i1 = Bars.Count - 2（直近確定足）
+i2 = Bars.Count - 3（その1本前）
+
+1) EMAクロス計算（確定足 i1/i2）
+
+crossUp = (close2 <= ema2) && (close1 > ema1)
+
+crossDown = (close2 >= ema2) && (close1 < ema1)
+
+2) エントリーモード EMA の「クロス足実体フィルタ」（※EMAモード時だけ）
+
+条件：
+
+EntryMode == エントリーモード.EMA && EntryTypeEmaCross && (crossUp || crossDown)
+判定：
+
+abs(Close1 - Open1) / PipSize < CrossCandleMinBodyPips なら return（入口否決）
+
+3) RR緩和（MinRR Relax）pending管理（UseCORERrRelaxStructure が true の場合）
+
+windowBars を決定（COREMODE=ONならSET値、OFFなら露出パラメータ）
+
+_rrRelaxPendingActive が古ければ ClearRrRelaxPending("EXPIRED")
+
+pending中なら クロス待ちせず plannedType = _rrRelaxPlannedType を採用（isRrPending=true）
+
+4) CORE入口抑制構造（UseCOREEntrySuppressionStructure が true の場合）
+
+ここが 「ModeCORE 本体」の入口抑制ロジックです（あなたのプロジェクト定義で移管対象の核心）。
+
+4-A) クロスがある場合（crossUp/crossDown）
+
+plannedType = Buy/Sell（クロス方向）
+
+reasonTag = "EMA_CROSS"
+
+pending（再接近）をリセット
+
+_ema20ReapproachPending=false
+
+_ema20PendingCreatedSignalIndex=-1
+
+Directionゲート（状態機械＋ヒステリシス＋最短維持バー）
+
+DirectionAllowsCOREModeEmaEntry(signalIndex, close1, ema1, plannedType)
+
+falseなら return
+
+Distanceゲート（遠すぎるなら再接近pendingを立てて return）
+
+IsCOREModeDistanceOkOrSetPending(signalIndex, close1, ema1, plannedType, out distReason)
+
+falseなら return（※ここで pending が立つ）
+
+4-B) クロスが無い場合
+
+再接近シグナルの消費のみ許可
+
+TryConsumeCOREModeReapproachSignal(signalIndex, close1, ema1, out intended, out reapReason)
+
+falseなら return
+
+plannedType = intended
+
+reasonTag = reapReason（例：EMA_CROSS_REAPPROACH 系）
+
+Directionゲート
+
+DirectionAllowsCOREModeEmaEntry(...)
+
+falseなら return
+
+5) CORE入口抑制構造がOFFの場合（通常ルート）
+
+useCrossEntry = EnableCOREMode || EntryTypeEmaCross
+
+Crossエントリの場合：
+
+pendingでなければ crossUp/crossDown が無いと return
+
+pendingなら同方向再判定（reasonTag="EMA_CROSS_PENDING"）
+
+Regimeの場合：
+
+close1 > ema1 なら Buy、close1 < ema1 なら Sell、それ以外 return
+
+さらに EnableDirectionImproveAdx のときだけ DirectionAllowsCOREModeEmaEntry が呼ばれる（※ADX=OFFなら副作用回避のため呼ばない、という実装）
+
+6) plannedType が確定したら、次段へ
+
+ExecuteEntryWithPlannedType(plannedType.Value, reasonTag, close1, ema1, i1);
+
+「入口抑制構造」の中身（呼ばれている3関数の要点）
+A) UseCOREEntrySuppressionStructure()
+
+return EnableCOREMode || EnableCOREEntrySuppressionStructure;
+
+COREMODEに依存せず入口抑制構造をONにできる設計
+
+B) DirectionAllowsCOREModeEmaEntry(...)
+
+方向は「EMA20に対して Above / Below / Neutral」の状態機械で決まる
+
+Deadzone（enterPips）＋ hysteresis（exitEnterRatio）＋ minHoldBars（状態最短維持）
+
+COREMODE=ONなら 固定値（CORE.cbotset準拠）
+
+COREMODE=OFFなら 露出パラメータ（再現用）
+
+ADX改善がONのときだけ、enterPips/ratio を加算したり、初動スキップを入れる分岐あり
+
+C) IsCOREModeDistanceOkOrSetPending(...)
+
+dist = abs(close - ema)
+
+dist <= maxDistPrice ならOK
+
+超えていたら：
+
+_ema20ReapproachPending=true
+
+_ema20PendingCreatedSignalIndex=signalIndex
+
+_ema20PendingTradeType=intended
+
+_ema20PendingReasonTag="EMA_CROSS"
+
+return false（＝このバーではエントリーしない）
+
+D) TryConsumeCOREModeReapproachSignal(...)
+
+pendingが無ければ false
+
+ageBars > window なら pending解除して false
+
+dist <= reapproachMaxDist なら pending消費して true（plannedType確定へ）

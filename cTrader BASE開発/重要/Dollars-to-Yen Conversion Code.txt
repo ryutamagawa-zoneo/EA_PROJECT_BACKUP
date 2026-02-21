@@ -1,0 +1,133 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Internals;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None, DefaultTimeFrame = "m5")]
+    public class HIVE_v40_8_H_Elite : Robot
+    {
+        [Parameter("Base Risk Amount ($)", DefaultValue = 1000)]
+        public double RiskAmount { get; set; }
+
+        [Parameter("Max Lot", DefaultValue = 10.0)]
+        public double MaxLot { get; set; }
+
+        [Parameter("Reward Ratio", DefaultValue = 2.0)]
+        public double RewardRatio { get; set; }
+
+        [Parameter("Daily Loss Limit (%)", DefaultValue = 1.8)]
+        public double DailyLossLimitPercent { get; set; }
+
+        private string _botLabel = "HIVE_H_Elite";
+        private double _initialBalance;
+        private bool _isDailyLimitHit = false;
+        private readonly TimeZoneInfo _jstZone = TimeZoneInfo.FindSystemTimeZoneById("Tokyo Standard Time");
+
+        protected override void OnStart()
+        {
+            _initialBalance = Account.Balance;
+        }
+
+        protected override void OnBar()
+        {
+            DateTime jstNow = TimeZoneInfo.ConvertTimeFromUtc(Server.TimeInUtc, _jstZone);
+
+            // 1. 強制決済（JST 4:00）
+            if (jstNow.Hour == 4 && jstNow.Minute == 0)
+            {
+                CloseAllPositions("HIVE Rule: 4AM Close");
+            }
+
+            // 2. 稼働許可時間帯（JST 9:15 ～ 翌3:59）
+            bool isAllowedTime = (jstNow.Hour == 9 && jstNow.Minute >= 15) || (jstNow.Hour > 9) || (jstNow.Hour < 4);
+            if (!isAllowedTime) return;
+
+            // 3. 日次損失フラグのリセット
+            if (_isDailyLimitHit && jstNow.Hour >= 9)
+            {
+                _isDailyLimitHit = false;
+                _initialBalance = Account.Balance;
+            }
+
+            // 4. 再エントリー待機（15分間）
+            var lastTrade = History.LastOrDefault(t => t.Label == _botLabel);
+            if (lastTrade != null && (Server.Time - lastTrade.ClosingTime).TotalMinutes < 15) return;
+
+            if (Positions.FindAll(_botLabel, SymbolName).Length > 0) return;
+
+            var b15 = MarketData.GetBars(TimeFrame.Minute15);
+            var b60 = MarketData.GetBars(TimeFrame.Hour);
+            if (b15.Count < 21 || b60.Count < 5) return;
+
+            // --- 【時間帯別ハイブリッド・ロジック：不変】 ---
+            if (jstNow.Hour >= 15 && jstNow.Hour < 21)
+            {
+                bool fvgUp = b15.LowPrices.Last(1) > b15.HighPrices.Last(3);
+                bool fvgDn = b15.HighPrices.Last(1) < b15.LowPrices.Last(3);
+
+                if (fvgUp && Bars.Last(1).Close > b15.HighPrices.Last(2)) ExecuteSMCTrade(TradeType.Buy);
+                else if (fvgDn && Bars.Last(1).Close < b15.LowPrices.Last(2)) ExecuteSMCTrade(TradeType.Sell);
+            }
+            else
+            {
+                bool setupUp = b15.HighPrices.Last(1) > b15.HighPrices.Last(2) && b15.LowPrices.Last(1) > b15.LowPrices.Last(2);
+                bool setupDn = b15.HighPrices.Last(1) < b15.HighPrices.Last(2) && b15.LowPrices.Last(1) < b15.LowPrices.Last(2);
+                bool trendUpH1 = b60.Last(1).Close > b60.Last(1).Open;
+                bool trendDnH1 = b60.Last(1).Close < b60.Last(1).Open;
+
+                if (setupUp && trendUpH1 && Bars.Last(1).Close > b15.HighPrices.Last(2)) ExecuteSMCTrade(TradeType.Buy);
+                else if (setupDn && trendDnH1 && Bars.Last(1).Close < b15.LowPrices.Last(2)) ExecuteSMCTrade(TradeType.Sell);
+            }
+        }
+
+        private void ExecuteSMCTrade(TradeType type)
+        {
+            var b15 = MarketData.GetBars(TimeFrame.Minute15);
+            double entry = (type == TradeType.Buy) ? Symbol.Ask : Symbol.Bid;
+            
+            // SL根拠：15分足直近20本構造を厳守
+            double structurePrice = (type == TradeType.Buy) ? b15.LowPrices.Minimum(20) : b15.HighPrices.Maximum(20);
+            double slPrice = (type == TradeType.Buy) ? structurePrice - (5 * Symbol.PipSize) : structurePrice + (5 * Symbol.PipSize);
+
+            // 1. 価格ベースの距離を算出
+            double priceDistance = Math.Abs(entry - slPrice);
+            if (priceDistance <= 0) return;
+
+            // 2. 【最重要：暴走停止ロジック】
+            // cTrader API: 1ユニット（1ロットではない）が1価格単位動いた時の口座通貨価値を算出
+            // これにより、GOLD、ドルストレート、クロス円すべてで「1ユニットあたりのリスク」が確定する
+            double riskPerUnit = priceDistance * (Symbol.PipValue / Symbol.PipSize);
+            
+            // 3. 総リスク額(1000ドル)を、1ユニットあたりのリスクで割り、発注数量(Units)を算出
+            double volumeInUnits = RiskAmount / riskPerUnit;
+
+            // 4. ロット数への換算（制限判定用：1ロット=100,000Units）
+            double calculatedLots = volumeInUnits / 100000;
+            if (calculatedLots > MaxLot)
+            {
+                volumeInUnits = MaxLot * 100000;
+            }
+
+            // 5. シンボルごとの最小単位・ステップに正規化
+            double finalVolume = Symbol.NormalizeVolumeInUnits(volumeInUnits, RoundingMode.Down);
+
+            if (finalVolume >= Symbol.VolumeInUnitsMin)
+            {
+                var result = ExecuteMarketOrder(type, SymbolName, finalVolume, _botLabel);
+                if (result.IsSuccessful && result.Position != null)
+                {
+                    double tpPips = (priceDistance / Symbol.PipSize) * RewardRatio;
+                    double tpPrice = (type == TradeType.Buy) ? entry + (tpPips * Symbol.PipSize) : entry - (tpPips * Symbol.PipSize);
+                    ModifyPosition(result.Position, slPrice, tpPrice);
+                }
+            }
+        }
+
+        private void CloseAllPositions(string reason)
+        {
+            foreach (var pos in Positions.FindAll(_botLabel, SymbolName)) ClosePosition(pos);
+        }
+    }
+}

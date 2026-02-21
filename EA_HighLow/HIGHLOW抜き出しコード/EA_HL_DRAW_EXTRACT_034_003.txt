@@ -1,0 +1,1489 @@
+// ============================================================
+// CODE NAME (Extract / Draw Only)
+// ============================================================
+// SOURCE: EA_HL_DEV_010_034
+// THIS  : EA_HL_DRAW_EXTRACT_034_003
+// SCOPE : HIGHLOW描画のみ（Env=H1固定 / Entry=M5固定）
+// NOTE  : リペイント無し化のみ許可されたため、Pivot計算の終端を「確定足（Count-2）」に限定
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using cAlgo.API;
+
+namespace cAlgo
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class EA_HL_DRAW_EXTRACT_034_003 : Robot
+    {
+        private const string CODE_NAME = "EA_HL_DRAW_EXTRACT_034_003";
+
+        // ============================================================
+        // HighLow関連（パラメータ：034から抜き出し）
+        // ============================================================
+        #region HighLow関連
+
+        [Parameter("HL_計算対象バー", Group = "HighLow関連", DefaultValue = 3000, MinValue = 200)]
+        public int HL_計算対象バー { get; set; }
+
+        [Parameter("HL_ログ：毎バー出す", Group = "HighLow関連", DefaultValue = false)]
+        public bool HL_ログ毎バー出す { get; set; }
+
+        [Parameter("HL_EA内部Pivot描画", Group = "HighLow関連", DefaultValue = false)]
+        public bool HL_EA内部Pivot描画 { get; set; }
+
+        [Parameter("HL_強制クリーン頻度(0=しない/1=毎回)", Group = "HighLow関連", DefaultValue = 50, MinValue = 0)]
+        public int HL_強制クリーン頻度 { get; set; }
+
+        #endregion
+
+        #region HLエントリー関連
+
+        public enum HL時間足
+        {
+            M5 = 1,
+            H1 = 3
+        }
+
+        [Parameter("HLロジック稼働（はい / いいえ）", Group = "HLエントリー関連", DefaultValue = true)]
+        public bool HL_EntryEnabled { get; set; }
+
+        [Parameter("ログ出力（はい / いいえ）", Group = "HLエントリー関連", DefaultValue = true)]
+        public bool HL_LogOutput { get; set; }
+
+        [Parameter("同値とみなす許容幅（ピップス）", Group = "HLエントリー関連", DefaultValue = 0.0, MinValue = 0.0)]
+        public double HL_EqualTolerancePips { get; set; }
+
+        public enum 環境足トレンドレス時_許可設定
+        {
+            許可 = 0,
+            禁止 = 1
+        }
+
+        [Parameter("環境足トレンドレス時：許可／禁止", Group = "HLエントリー関連", DefaultValue = 環境足トレンドレス時_許可設定.許可)]
+        public 環境足トレンドレス時_許可設定 環境足トレンドレス時 { get; set; }
+
+        [Parameter("環境足とエントリー足が反対なら禁止：はい／いいえ", Group = "HLエントリー関連", DefaultValue = true)]
+        public bool 環境足とエントリー足反対禁止 { get; set; }
+
+        #endregion
+
+        // ============================================================
+        // HL描画パラメータ（034と同値・変更禁止領域）
+        // ============================================================
+        private const int HL_ZZ_Depth = 12;
+        private const double HL_Points = 50.0;
+        private const int HL_Backstep = 3;
+        private const double HL_SuppressPoints = 0.0;
+        private const bool HL_同値右優先 = true;
+        private const int MaxBars = 500;
+        private const int HL_RightBars_M5 = 3;
+        private const int HL_RightBars_H1 = 3;
+        private const int HL_LabelFontSize = 9;
+        private const int HL_LabelYOffsetTicks = 1;
+        private bool EnableProReport { get { return true; } }
+
+        // Draw object name prefix
+        private const string HL_DrawObjectPrefix = CODE_NAME + ".";
+
+        // 旧prefix削除対象（運用：直近バージョン差し替え時のゴミ掃除用）
+        private const string HL_OldDrawObjectPrefix_010_034 = "EA_HL_DEV_010_034.";
+        private const string HL_OldDrawObjectPrefix_010_033 = "EA_HL_DEV_010_033.";
+        private static readonly string[] HL_OldDrawObjectPrefixes = new[]
+        {
+            HL_OldDrawObjectPrefix_010_034,
+            HL_OldDrawObjectPrefix_010_033
+        };
+
+        private const int HL_ForceCleanLogNameLimit = 10;
+
+        // ============================================================
+        // データ構造（034から抜き出し）
+        // ============================================================
+        public struct HL_Pivot
+        {
+            public int Index;
+            public DateTime Time;
+            public double Price;
+            public int Side;   // 1=High, -1=Low
+            public string Kind; // H/L/HH/HL/LH/LL
+        }
+
+        private enum TrendState
+        {
+            TrendLess = 0,
+            UpTrend = 1,
+            DownTrend = 2
+        }
+
+        private enum TrendLessContext
+        {
+            None = 0,
+            AfterDownEnd = 1,
+            AfterUpEnd = 2
+        }
+
+        // ============================================================
+        // 状態
+        // ============================================================
+        private Bars _barsM5;
+        private Bars _barsH1;
+
+        private DateTime _lastPivotCalcBarTimeM5 = DateTime.MinValue;
+        private DateTime _lastPivotCalcBarTimeH1 = DateTime.MinValue;
+
+        private List<HL_Pivot> _m5Pivots = new List<HL_Pivot>();
+        private List<HL_Pivot> _h1Pivots = new List<HL_Pivot>();
+        private List<HL_Pivot> _h1Projected = new List<HL_Pivot>();
+
+        private readonly List<string> _hlDrawNames = new List<string>(4096);
+        private bool _hlRedrawPending = false;
+        private int _hlClearCallCount = 0;
+        private TimeZoneInfo _jstTz;
+
+        private const string HLDOW_STATUS_NAME_H1 = CODE_NAME + ".HLDOW_STATUS_H1";
+        private const string HLDOW_STATUS_NAME_M5 = CODE_NAME + ".HLDOW_STATUS_M5";
+
+        private StackPanel _hlDowStatusPanel;
+        private TextBlock _hlDowStatusTextM5;
+        private TextBlock _hlDowStatusTextH1;
+
+        private string _hlDowLastDrawnH1Text = "";
+        private string _hlDowLastDrawnM5Text = "";
+
+        private TrendState _hlDowStateM5 = TrendState.TrendLess;
+        private TrendState _hlDowStateH1 = TrendState.TrendLess;
+
+        private TrendLessContext _hlDowContextM5 = TrendLessContext.None;
+        private TrendLessContext _hlDowContextH1 = TrendLessContext.None;
+
+        private DateTime _hlDowContextStartTimeM5 = DateTime.MinValue;
+        private DateTime _hlDowContextStartTimeH1 = DateTime.MinValue;
+
+        private DateTime _hlDowLastProcessedBarTimeM5 = DateTime.MinValue;
+        private DateTime _hlDowLastProcessedBarTimeH1 = DateTime.MinValue;
+
+        private DateTime _hlDowLastLoggedBarTimeM5 = DateTime.MinValue;
+        private DateTime _hlDowLastLoggedBarTimeH1 = DateTime.MinValue;
+
+        // ============================================================
+        // Lifecycle
+        // ============================================================
+        protected override void OnStart()
+        {
+            _barsM5 = MarketData.GetBars(TimeFrame.Minute5, SymbolName);
+            _barsH1 = MarketData.GetBars(TimeFrame.Hour, SymbolName);
+            _jstTz = ResolveTokyoTimeZone();
+
+            int failed;
+            HL_ForceCleanDrawingsByPrefix(out failed);
+
+            DateTime utcNow = UtcNow();
+            HL_RecalculateAndProject();
+            EvaluateHlDowAndUpdateUi(utcNow, true);
+            HL_RedrawPivots();
+        }
+
+        protected override void OnStop()
+        {
+            HL_ClearDrawings(true);
+            RemoveHlDowStatusDisplay();
+        }
+
+        protected override void OnBar()
+        {
+            // M5チャート運用想定。チャート足が何であっても、描画はM5/H1で更新する。
+            DateTime utcNow = UtcNow();
+            HL_RecalculateAndProject();
+            EvaluateHlDowAndUpdateUi(utcNow, false);
+            HL_RedrawPivots();
+        }
+
+        // ============================================================
+        // Pivot計算（M5/H1のみ）
+        // ============================================================
+        private void HL_RecalculateAndProject()
+        {
+            if ((_barsM5 == null || _barsM5.Count < 10) &&
+                (_barsH1 == null || _barsH1.Count < 10))
+            {
+                _m5Pivots = new List<HL_Pivot>();
+                _h1Pivots = new List<HL_Pivot>();
+                _h1Projected = new List<HL_Pivot>();
+                return;
+            }
+
+            int maxBars = MaxBars;
+
+            HL_RebuildPivotsIfNeeded(_barsM5, HL_RightBars_M5, maxBars, ref _lastPivotCalcBarTimeM5, ref _m5Pivots);
+            HL_RebuildPivotsIfNeeded(_barsH1, HL_RightBars_H1, maxBars, ref _lastPivotCalcBarTimeH1, ref _h1Pivots);
+
+            _h1Projected = HL_ProjectToM5(_h1Pivots);
+        }
+
+        private void HL_RebuildPivotsIfNeeded(Bars bars, int rightBars, int maxBars, ref DateTime lastCalcBarTime, ref List<HL_Pivot> target)
+        {
+            if (bars == null || bars.Count < 10)
+            {
+                target = new List<HL_Pivot>();
+                lastCalcBarTime = DateTime.MinValue;
+                return;
+            }
+
+            int closedIndex = bars.Count - 2;
+            if (closedIndex < 0 || closedIndex >= bars.Count)
+                return;
+
+            DateTime closedBarTime = bars.OpenTimes[closedIndex];
+            if (target != null && target.Count > 0 && lastCalcBarTime == closedBarTime)
+                return;
+
+            target = HL_BuildPivots(bars, rightBars, maxBars);
+            lastCalcBarTime = closedBarTime;
+        }
+
+        private string HL_FormatLastPivot(List<HL_Pivot> pivots)
+        {
+            if (pivots == null || pivots.Count == 0)
+                return "none";
+
+            var p = pivots[pivots.Count - 1];
+            string type = HL_GetPivotDisplayText(p);
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "idx={0},time={1:yyyy-MM-dd HH:mm},side={2},price={3},type={4}",
+                p.Index,
+                p.Time,
+                p.Side > 0 ? "H" : "L",
+                p.Price,
+                type
+            );
+        }
+
+        private string HL_GetPivotDisplayText(HL_Pivot pivot)
+        {
+            string kind = NormalizePivotKind(pivot.Kind);
+            if (pivot.Side == 1)
+                return (kind == "HH" || kind == "LH") ? kind : "H";
+
+            if (pivot.Side == -1)
+                return (kind == "HL" || kind == "LL") ? kind : "L";
+
+            return "NA";
+        }
+
+        private Color HL_GetPivotDisplayColor(HL_Pivot pivot, string text)
+        {
+            if (pivot.Side == 1)
+            {
+                if (text == "HH") return Color.Lime;
+                if (text == "LH") return Color.Orange;
+                return Color.Gray;
+            }
+
+            if (pivot.Side == -1)
+            {
+                if (text == "HL") return Color.Aqua;
+                if (text == "LL") return Color.Red;
+                return Color.Gray;
+            }
+
+            return Color.Gray;
+        }
+
+        private void HL_AssignPivotKindsByDisplayRule(List<HL_Pivot> pivots)
+        {
+            if (pivots == null || pivots.Count == 0)
+                return;
+
+            double? prevHigh = null;
+            double? prevLow = null;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                HL_Pivot p = pivots[i];
+                if (p.Side == 1)
+                {
+                    p.Kind = prevHigh.HasValue ? (p.Price > prevHigh.Value ? "HH" : "LH") : "H";
+                    prevHigh = p.Price;
+                }
+                else if (p.Side == -1)
+                {
+                    p.Kind = prevLow.HasValue ? (p.Price > prevLow.Value ? "HL" : "LL") : "L";
+                    prevLow = p.Price;
+                }
+                else
+                {
+                    p.Kind = string.Empty;
+                }
+
+                pivots[i] = p;
+            }
+        }
+
+        private List<HL_Pivot> HL_BuildPivots(Bars bars, int rightBars, int maxBars)
+        {
+            var pivots = new List<HL_Pivot>(1024);
+            if (bars == null || bars.Count < 10)
+                return pivots;
+
+            // ============================================================
+            // 【リペイント無し化（許可された修正点）】
+            // endIndex を「未確定足(Count-1)」ではなく「確定足(Count-2)」に固定する
+            // ============================================================
+            int endIndex = bars.Count - 2;
+            if (endIndex < 0) return pivots;
+
+            int startIndex = Math.Max(0, endIndex - Math.Max(10, maxBars));
+            int maxCandidate = Math.Max(startIndex, endIndex - Math.Max(0, rightBars));
+
+            double deviation = HL_GetDeviationPrice(HL_Points);
+            double suppress = HL_GetDeviationPrice(HL_SuppressPoints);
+            HL_Pivot? last = null;
+
+            for (int i = startIndex + HL_ZZ_Depth; i <= maxCandidate; i++)
+            {
+                bool isHigh = HL_IsPivotHigh(bars, i, startIndex, maxCandidate, HL_ZZ_Depth, rightBars, HL_同値右優先);
+                bool isLow = HL_IsPivotLow(bars, i, startIndex, maxCandidate, HL_ZZ_Depth, rightBars, HL_同値右優先);
+
+                if (isHigh && isLow)
+                {
+                    if (last.HasValue)
+                    {
+                        if (last.Value.Side == 1)
+                            isHigh = false;
+                        else
+                            isLow = false;
+                    }
+                    else
+                    {
+                        isLow = false; // 初回はHigh側を採用
+                    }
+                }
+
+                if (isHigh)
+                {
+                    var c = new HL_Pivot
+                    {
+                        Index = i,
+                        Time = bars.OpenTimes[i],
+                        Price = bars.HighPrices[i],
+                        Side = 1,
+                        Kind = string.Empty
+                    };
+                    if (HL_TryAcceptPivot(c, ref last, pivots, deviation, suppress, HL_Backstep))
+                        continue;
+                }
+
+                if (isLow)
+                {
+                    var c = new HL_Pivot
+                    {
+                        Index = i,
+                        Time = bars.OpenTimes[i],
+                        Price = bars.LowPrices[i],
+                        Side = -1,
+                        Kind = string.Empty
+                    };
+                    HL_TryAcceptPivot(c, ref last, pivots, deviation, suppress, HL_Backstep);
+                }
+            }
+
+            HL_AssignPivotKindsByDisplayRule(pivots);
+            return pivots;
+        }
+
+        private double HL_GetDeviationPrice(double points)
+        {
+            return points <= 0.0 ? 0.0 : points * Symbol.TickSize;
+        }
+
+        private static bool HL_IsPivotHigh(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double h = bars.HighPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i)
+                    continue;
+                if (bars.HighPrices[k] > h)
+                    return false;
+                if (tieRight && k > i && bars.HighPrices[k] == h)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool HL_IsPivotLow(Bars bars, int i, int startIndex, int maxCandidate, int depth, int rightBars, bool tieRight)
+        {
+            int left = Math.Max(startIndex, i - depth);
+            int right = Math.Min(maxCandidate, i + Math.Max(0, rightBars));
+            double l = bars.LowPrices[i];
+
+            for (int k = left; k <= right; k++)
+            {
+                if (k == i)
+                    continue;
+                if (bars.LowPrices[k] < l)
+                    return false;
+                if (tieRight && k > i && bars.LowPrices[k] == l)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool HL_TryAcceptPivot(HL_Pivot candidate, ref HL_Pivot? last, List<HL_Pivot> pivots, double deviation, double suppress, int backstep)
+        {
+            if (suppress > 0.0 && last.HasValue)
+            {
+                if (Math.Abs(candidate.Price - last.Value.Price) < suppress)
+                    return false;
+            }
+
+            if (!last.HasValue)
+            {
+                pivots.Add(candidate);
+                last = candidate;
+                return true;
+            }
+
+            var prev = last.Value;
+
+            if (candidate.Side == prev.Side)
+            {
+                if (backstep > 0 && (candidate.Index - prev.Index) <= backstep)
+                {
+                    bool moreExtreme =
+                        (candidate.Side == 1 && candidate.Price >= prev.Price) ||
+                        (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                    if (moreExtreme)
+                    {
+                        pivots[pivots.Count - 1] = candidate;
+                        last = candidate;
+                        return true;
+                    }
+                    return false;
+                }
+
+                bool replace =
+                    (candidate.Side == 1 && candidate.Price >= prev.Price) ||
+                    (candidate.Side == -1 && candidate.Price <= prev.Price);
+
+                if (replace)
+                {
+                    pivots[pivots.Count - 1] = candidate;
+                    last = candidate;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (deviation > 0.0 && Math.Abs(candidate.Price - prev.Price) < deviation)
+                return false;
+
+            pivots.Add(candidate);
+            last = candidate;
+            return true;
+        }
+
+        private static string NormalizePivotKind(string kind)
+        {
+            return string.IsNullOrWhiteSpace(kind) ? string.Empty : kind.Trim().ToUpperInvariant();
+        }
+
+        private List<HL_Pivot> HL_ProjectToM5(List<HL_Pivot> h1Pivots)
+        {
+            var projected = new List<HL_Pivot>(h1Pivots == null ? 0 : h1Pivots.Count);
+            if (h1Pivots == null || h1Pivots.Count == 0 || _barsM5 == null || _barsM5.Count <= 0)
+                return projected;
+
+            for (int i = 0; i < h1Pivots.Count; i++)
+            {
+                var p = h1Pivots[i];
+                int m5Index;
+                try
+                {
+                    m5Index = _barsM5.OpenTimes.GetIndexByTime(p.Time);
+                }
+                catch
+                {
+                    m5Index = -1;
+                }
+
+                if (m5Index < 0 || m5Index >= _barsM5.Count)
+                    continue;
+
+                projected.Add(new HL_Pivot
+                {
+                    Index = m5Index,
+                    Time = _barsM5.OpenTimes[m5Index],
+                    Price = p.Price,
+                    Side = p.Side,
+                    Kind = p.Kind
+                });
+            }
+
+            return projected;
+        }
+
+        private static bool IsPivotKind(HL_Pivot pivot, string expected)
+        {
+            return string.Equals(NormalizePivotKind(pivot.Kind), expected, StringComparison.Ordinal);
+        }
+
+        private static bool IsHighPivotKind(HL_Pivot pivot)
+        {
+            string kind = NormalizePivotKind(pivot.Kind);
+            return kind == "HH" || kind == "LH";
+        }
+
+        private static bool IsLowPivotKind(HL_Pivot pivot)
+        {
+            string kind = NormalizePivotKind(pivot.Kind);
+            return kind == "HL" || kind == "LL";
+        }
+
+        private static bool TryFindFirstPivotAfterTime(
+            List<HL_Pivot> pivots,
+            DateTime afterTime,
+            Func<HL_Pivot, bool> predicate,
+            out HL_Pivot found)
+        {
+            found = default(HL_Pivot);
+
+            if (pivots == null || pivots.Count == 0 || predicate == null)
+                return false;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                HL_Pivot p = pivots[i];
+                if (p.Time <= afterTime)
+                    continue;
+
+                if (predicate(p))
+                {
+                    found = p;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void ResetHlDowStateMachine()
+        {
+            _hlDowStateM5 = TrendState.TrendLess;
+            _hlDowStateH1 = TrendState.TrendLess;
+
+            _hlDowContextM5 = TrendLessContext.None;
+            _hlDowContextH1 = TrendLessContext.None;
+
+            _hlDowContextStartTimeM5 = DateTime.MinValue;
+            _hlDowContextStartTimeH1 = DateTime.MinValue;
+
+            _hlDowLastProcessedBarTimeM5 = DateTime.MinValue;
+            _hlDowLastProcessedBarTimeH1 = DateTime.MinValue;
+
+            _hlDowLastLoggedBarTimeM5 = DateTime.MinValue;
+            _hlDowLastLoggedBarTimeH1 = DateTime.MinValue;
+        }
+
+        private void EvaluateHlDowAndUpdateUi(DateTime utcNow, bool initializeOnStart)
+        {
+            if (initializeOnStart)
+                ResetHlDowStateMachine();
+
+            bool isM5Chart = (Bars != null && Bars.TimeFrame == TimeFrame.Minute5);
+            List<HL_Pivot> h1Input = isM5Chart ? (_h1Projected ?? new List<HL_Pivot>()) : (_h1Pivots ?? new List<HL_Pivot>());
+
+            EvaluateOneTf("M5", _m5Pivots ?? new List<HL_Pivot>(), ResolveBarsForTf(HL時間足.M5), ref _hlDowStateM5, ref _hlDowContextM5, ref _hlDowContextStartTimeM5, ref _hlDowLastProcessedBarTimeM5, ref _hlDowLastLoggedBarTimeM5, utcNow);
+            EvaluateOneTf("H1", h1Input, ResolveBarsForTf(HL時間足.H1), ref _hlDowStateH1, ref _hlDowContextH1, ref _hlDowContextStartTimeH1, ref _hlDowLastProcessedBarTimeH1, ref _hlDowLastLoggedBarTimeH1, utcNow);
+
+            UpdateHlDowStatusDisplay(initializeOnStart, _hlDowStateM5, _hlDowStateH1);
+        }
+
+        private Bars ResolveBarsForTf(HL時間足 tf)
+        {
+            switch (tf)
+            {
+                case HL時間足.M5:
+                    if ((_barsM5 == null || _barsM5.Count < 2) && Bars != null && Bars.TimeFrame == TimeFrame.Minute5)
+                        return Bars;
+                    return _barsM5;
+                default:
+                    if ((_barsH1 == null || _barsH1.Count < 2) && Bars != null && Bars.TimeFrame == TimeFrame.Hour)
+                        return Bars;
+                    return _barsH1;
+            }
+        }
+
+        // Dow Theory trend state machine (non-repaint pivots). Close-only, strict inequality.
+        private TrendState DetermineTrendFromDowStateMachine(
+            ref TrendState state,
+            ref TrendLessContext context,
+            ref DateTime contextStartTime,
+            List<HL_Pivot> pivots,
+            Bars bars,
+            DateTime currentBarTime,
+            double currentClose,
+            out HL_Pivot? lastHH,
+            out HL_Pivot? lastHL,
+            out HL_Pivot? lastLH,
+            out HL_Pivot? lastLL,
+            out HL_Pivot? keyLH,
+            out HL_Pivot? keyHL,
+            out HL_Pivot? triggerHigh,
+            out HL_Pivot? triggerLow)
+        {
+            lastHH = null;
+            lastHL = null;
+            lastLH = null;
+            lastLL = null;
+            keyLH = null;
+            keyHL = null;
+            triggerHigh = null;
+            triggerLow = null;
+
+            if (pivots == null || pivots.Count == 0 || bars == null || bars.Count < 3)
+                return (state = TrendState.TrendLess);
+
+            int closedIndex = bars.Count - 2;
+            if (closedIndex < 1)
+                return (state = TrendState.TrendLess);
+
+            double prevClose = bars.ClosePrices[closedIndex - 1];
+
+            int lastHHIndex = -1;
+            int lastHLIndex = -1;
+            int lastLHIndex = -1;
+            int lastLLIndex = -1;
+
+            for (int i = pivots.Count - 1; i >= 0; i--)
+            {
+                HL_Pivot p = pivots[i];
+
+                if (lastHHIndex < 0 && IsPivotKind(p, "HH")) { lastHH = p; lastHHIndex = i; }
+                if (lastHLIndex < 0 && IsPivotKind(p, "HL")) { lastHL = p; lastHLIndex = i; }
+                if (lastLHIndex < 0 && IsPivotKind(p, "LH")) { lastLH = p; lastLHIndex = i; }
+                if (lastLLIndex < 0 && IsPivotKind(p, "LL")) { lastLL = p; lastLLIndex = i; }
+
+                if (lastHHIndex >= 0 && lastHLIndex >= 0 && lastLHIndex >= 0 && lastLLIndex >= 0)
+                    break;
+            }
+
+            if (lastLLIndex >= 0)
+            {
+                for (int i = lastLLIndex - 1; i >= 0; i--)
+                {
+                    HL_Pivot p = pivots[i];
+                    if (IsPivotKind(p, "LH")) { keyLH = p; break; }
+                }
+            }
+
+            if (lastHHIndex >= 0)
+            {
+                for (int i = lastHHIndex - 1; i >= 0; i--)
+                {
+                    HL_Pivot p = pivots[i];
+                    if (IsPivotKind(p, "HL")) { keyHL = p; break; }
+                }
+            }
+
+            HL_Pivot? candTrigHigh = null;
+            if (lastHLIndex >= 0)
+            {
+                for (int i = lastHLIndex + 1; i < pivots.Count; i++)
+                {
+                    HL_Pivot p = pivots[i];
+                    if (IsHighPivotKind(p)) { candTrigHigh = p; break; }
+                }
+            }
+
+            HL_Pivot? candTrigLow = null;
+            if (lastLHIndex >= 0)
+            {
+                for (int i = lastLHIndex + 1; i < pivots.Count; i++)
+                {
+                    HL_Pivot p = pivots[i];
+                    if (IsLowPivotKind(p)) { candTrigLow = p; break; }
+                }
+            }
+
+            triggerHigh = candTrigHigh;
+            triggerLow = candTrigLow;
+
+            if (context == TrendLessContext.AfterDownEnd && contextStartTime != DateTime.MinValue)
+            {
+                HL_Pivot transitionHL;
+                if (TryFindFirstPivotAfterTime(pivots, contextStartTime, p => IsPivotKind(p, "HL"), out transitionHL))
+                {
+                    HL_Pivot trigH;
+                    if (TryFindFirstPivotAfterTime(pivots, transitionHL.Time, p => IsHighPivotKind(p), out trigH))
+                        triggerHigh = trigH;
+                }
+            }
+
+            if (context == TrendLessContext.AfterUpEnd && contextStartTime != DateTime.MinValue)
+            {
+                HL_Pivot transitionLH;
+                if (TryFindFirstPivotAfterTime(pivots, contextStartTime, p => IsPivotKind(p, "LH"), out transitionLH))
+                {
+                    HL_Pivot trigL;
+                    if (TryFindFirstPivotAfterTime(pivots, transitionLH.Time, p => IsLowPivotKind(p), out trigL))
+                        triggerLow = trigL;
+                }
+            }
+
+            bool structureBroken = false;
+
+            if (lastHH.HasValue && lastHL.HasValue && lastHL.Value.Price > lastHH.Value.Price)
+                structureBroken = true;
+
+            if (lastLL.HasValue && lastLH.HasValue && lastLH.Value.Price < lastLL.Value.Price)
+                structureBroken = true;
+
+            if (structureBroken)
+            {
+                state = TrendState.TrendLess;
+                context = TrendLessContext.None;
+                contextStartTime = DateTime.MinValue;
+                return state;
+            }
+
+            bool downEndEventNow = keyLH.HasValue && prevClose <= keyLH.Value.Price && currentClose > keyLH.Value.Price;
+            bool upEndEventNow = keyHL.HasValue && prevClose >= keyHL.Value.Price && currentClose < keyHL.Value.Price;
+
+            bool upConfirmEventNow = triggerHigh.HasValue && prevClose <= triggerHigh.Value.Price && currentClose > triggerHigh.Value.Price;
+            bool downConfirmEventNow = triggerLow.HasValue && prevClose >= triggerLow.Value.Price && currentClose < triggerLow.Value.Price;
+
+            bool hardUpConfirmEventNow = lastHH.HasValue && (((prevClose <= lastHH.Value.Price) && (currentClose > lastHH.Value.Price)) || (currentClose > lastHH.Value.Price));
+            bool hardDownConfirmEventNow = lastLL.HasValue && (((prevClose >= lastLL.Value.Price) && (currentClose < lastLL.Value.Price)) || (currentClose < lastLL.Value.Price));
+
+            upConfirmEventNow = upConfirmEventNow || hardUpConfirmEventNow;
+            downConfirmEventNow = downConfirmEventNow || hardDownConfirmEventNow;
+
+            if (context == TrendLessContext.AfterDownEnd && contextStartTime != DateTime.MinValue)
+            {
+                HL_Pivot transitionHL;
+                if (TryFindFirstPivotAfterTime(pivots, contextStartTime, p => IsPivotKind(p, "HL"), out transitionHL))
+                {
+                    HL_Pivot? baseHH = null;
+                    for (int i = pivots.Count - 1; i >= 0; i--)
+                    {
+                        HL_Pivot p = pivots[i];
+                        if (p.Time >= transitionHL.Time)
+                            continue;
+                        if (IsPivotKind(p, "HH"))
+                        {
+                            baseHH = p;
+                            break;
+                        }
+                    }
+
+                    if (baseHH.HasValue)
+                    {
+                        upConfirmEventNow = ((prevClose <= baseHH.Value.Price) && (currentClose > baseHH.Value.Price)) || (currentClose > baseHH.Value.Price);
+                        upConfirmEventNow = upConfirmEventNow || hardUpConfirmEventNow;
+                    }
+                }
+            }
+
+            if (context == TrendLessContext.AfterUpEnd && contextStartTime != DateTime.MinValue)
+            {
+                HL_Pivot transitionLH;
+                if (TryFindFirstPivotAfterTime(pivots, contextStartTime, p => IsPivotKind(p, "LH"), out transitionLH))
+                {
+                    HL_Pivot? baseLL = null;
+                    for (int i = pivots.Count - 1; i >= 0; i--)
+                    {
+                        HL_Pivot p = pivots[i];
+                        if (p.Time >= transitionLH.Time)
+                            continue;
+                        if (IsPivotKind(p, "LL"))
+                        {
+                            baseLL = p;
+                            break;
+                        }
+                    }
+
+                    if (baseLL.HasValue)
+                    {
+                        downConfirmEventNow = ((prevClose >= baseLL.Value.Price) && (currentClose < baseLL.Value.Price)) || (currentClose < baseLL.Value.Price);
+                        downConfirmEventNow = downConfirmEventNow || hardDownConfirmEventNow;
+                    }
+                }
+            }
+
+            if (state == TrendState.DownTrend)
+            {
+                if (downEndEventNow)
+                {
+                    if (upConfirmEventNow)
+                    {
+                        state = TrendState.UpTrend;
+                        context = TrendLessContext.None;
+                        contextStartTime = DateTime.MinValue;
+                        return state;
+                    }
+
+                    state = TrendState.TrendLess;
+                    context = TrendLessContext.AfterDownEnd;
+                    contextStartTime = currentBarTime;
+                    return state;
+                }
+
+                return state;
+            }
+
+            if (state == TrendState.UpTrend)
+            {
+                if (upEndEventNow)
+                {
+                    if (downConfirmEventNow)
+                    {
+                        state = TrendState.DownTrend;
+                        context = TrendLessContext.None;
+                        contextStartTime = DateTime.MinValue;
+                        return state;
+                    }
+
+                    state = TrendState.TrendLess;
+                    context = TrendLessContext.AfterUpEnd;
+                    contextStartTime = currentBarTime;
+                    return state;
+                }
+
+                return state;
+            }
+
+            if (context == TrendLessContext.AfterDownEnd)
+            {
+                if (upConfirmEventNow)
+                {
+                    state = TrendState.UpTrend;
+                    context = TrendLessContext.None;
+                    contextStartTime = DateTime.MinValue;
+                    return state;
+                }
+
+                return (state = TrendState.TrendLess);
+            }
+
+            if (context == TrendLessContext.AfterUpEnd)
+            {
+                if (downConfirmEventNow)
+                {
+                    state = TrendState.DownTrend;
+                    context = TrendLessContext.None;
+                    contextStartTime = DateTime.MinValue;
+                    return state;
+                }
+
+                return (state = TrendState.TrendLess);
+            }
+
+            bool canInferUp = (lastHHIndex >= 0) && keyHL.HasValue && ((lastLLIndex < 0) || (lastHHIndex > lastLLIndex)) && (currentClose >= keyHL.Value.Price);
+            bool canInferDown = (lastLLIndex >= 0) && keyLH.HasValue && ((lastHHIndex < 0) || (lastLLIndex > lastHHIndex)) && (currentClose <= keyLH.Value.Price);
+
+            if (canInferUp)
+                return (state = TrendState.UpTrend);
+
+            if (canInferDown)
+                return (state = TrendState.DownTrend);
+
+            return (state = TrendState.TrendLess);
+        }
+
+        private void EvaluateOneTf(
+            string tf,
+            List<HL_Pivot> input,
+            Bars bars,
+            ref TrendState state,
+            ref TrendLessContext context,
+            ref DateTime contextStart,
+            ref DateTime lastProcessedBarTime,
+            ref DateTime lastLoggedBarTime,
+            DateTime utcNow)
+        {
+            DateTime barTime;
+            double close;
+            if (!TryGetLastClosedBarInfo(bars, out barTime, out close))
+                return;
+
+            bool newBar = (barTime != lastProcessedBarTime);
+            if (!newBar)
+                return;
+
+            lastProcessedBarTime = barTime;
+
+            HL_Pivot? lastHH = null, lastHL = null, lastLH = null, lastLL = null;
+            HL_Pivot? keyLH = null, keyHL = null, triggerHigh = null, triggerLow = null;
+
+            DetermineTrendFromDowStateMachine(
+                ref state,
+                ref context,
+                ref contextStart,
+                input,
+                bars,
+                barTime,
+                close,
+                out lastHH,
+                out lastHL,
+                out lastLH,
+                out lastLL,
+                out keyLH,
+                out keyHL,
+                out triggerHigh,
+                out triggerLow);
+
+            if (HL_LogOutput && barTime != lastLoggedBarTime)
+            {
+                lastLoggedBarTime = barTime;
+                PrintHlDowDecisionLog(tf, barTime, close, keyLH, keyHL, triggerHigh, triggerLow, lastHH, lastHL, lastLH, lastLL, state, utcNow);
+            }
+        }
+
+        private bool TryGetLastClosedBarInfo(Bars bars, out DateTime barTime, out double close)
+        {
+            barTime = DateTime.MinValue;
+            close = 0.0;
+
+            if (bars == null || bars.Count < 2)
+                return false;
+
+            int closedIndex = bars.Count - 2;
+            if (closedIndex < 0 || closedIndex >= bars.Count)
+                return false;
+
+            barTime = bars.OpenTimes[closedIndex];
+            close = bars.ClosePrices[closedIndex];
+            return true;
+        }
+
+        private void PrintHlDowDecisionLog(
+            string tf,
+            DateTime barTime,
+            double currentClose,
+            HL_Pivot? keyLH,
+            HL_Pivot? keyHL,
+            HL_Pivot? triggerHigh,
+            HL_Pivot? triggerLow,
+            HL_Pivot? lastHH,
+            HL_Pivot? lastHL,
+            HL_Pivot? lastLH,
+            HL_Pivot? lastLL,
+            TrendState state,
+            DateTime utcNow)
+        {
+            Print(
+                "[{0}][{1}] t={2} Close={3} KeyLH={4} KeyHL={5} TrigH={6} TrigL={7} HH={8} HL={9} LH={10} LL={11} => {12}{13}",
+                CODE_NAME,
+                tf,
+                FormatStructureTimeForLog(barTime),
+                FormatStructurePriceForLog(currentClose),
+                FormatStructurePriceForLog(keyLH),
+                FormatStructurePriceForLog(keyHL),
+                FormatStructurePriceForLog(triggerHigh),
+                FormatStructurePriceForLog(triggerLow),
+                FormatStructurePriceForLog(lastHH),
+                FormatStructurePriceForLog(lastHL),
+                FormatStructurePriceForLog(lastLH),
+                FormatStructurePriceForLog(lastLL),
+                FormatHlDowTrendStateForLog(state),
+                BuildTimeTag(utcNow));
+        }
+
+        private string FormatStructurePriceForLog(HL_Pivot? pivot)
+        {
+            return pivot.HasValue
+                ? pivot.Value.Price.ToString("F5", CultureInfo.InvariantCulture)
+                : "NA";
+        }
+
+        private string FormatStructurePriceForLog(double value)
+        {
+            return value.ToString("F5", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatStructureTimeForLog(DateTime value)
+        {
+            if (value == DateTime.MinValue)
+                return "NA";
+
+            DateTime utc = DateTime.SpecifyKind(value, DateTimeKind.Utc);
+            return utc.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+        }
+
+        private string FormatHlDowTrendStateForLog(TrendState state)
+        {
+            if (state == TrendState.UpTrend)
+                return "UpTrend";
+            if (state == TrendState.DownTrend)
+                return "DownTrend";
+            return "TrendLess";
+        }
+
+        private string FormatHlDowTrendState(TrendState state)
+        {
+            if (state == TrendState.UpTrend)
+                return "UP TREND";
+            if (state == TrendState.DownTrend)
+                return "DOWN TREND";
+            return "TREND LESS";
+        }
+
+        private Color ResolveHlDowStateColor(TrendState state)
+        {
+            if (state == TrendState.UpTrend)
+                return Color.LightSkyBlue;
+            if (state == TrendState.DownTrend)
+                return Color.Red;
+            return Color.Yellow;
+        }
+
+        private void EnsureHlDowStatusPanel()
+        {
+            if (_hlDowStatusPanel != null)
+                return;
+
+            if (Chart == null)
+                return;
+
+            _hlDowStatusPanel = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(0, 0, 8, 8)
+            };
+
+            _hlDowStatusTextM5 = new TextBlock
+            {
+                FontSize = 18,
+                Margin = new Thickness(0, 0, 0, 0)
+            };
+
+            _hlDowStatusTextH1 = new TextBlock
+            {
+                FontSize = 18,
+                Margin = new Thickness(0, 0, 0, 0)
+            };
+
+            _hlDowStatusPanel.AddChild(_hlDowStatusTextM5);
+            _hlDowStatusPanel.AddChild(_hlDowStatusTextH1);
+
+            Chart.AddControl(_hlDowStatusPanel);
+        }
+
+        private void UpdateHlDowStatusDisplay(bool force, TrendState m5State, TrendState h1State)
+        {
+            string m5Line = "M5 : " + FormatHlDowTrendState(m5State);
+            string h1Line = "H1 : " + FormatHlDowTrendState(h1State);
+
+            if (!force &&
+                string.Equals(_hlDowLastDrawnH1Text, h1Line, StringComparison.Ordinal) &&
+                string.Equals(_hlDowLastDrawnM5Text, m5Line, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _hlDowLastDrawnH1Text = h1Line;
+            _hlDowLastDrawnM5Text = m5Line;
+
+            BeginInvokeOnMainThread(() =>
+            {
+                try
+                {
+                    if (Chart == null)
+                        return;
+
+                    EnsureHlDowStatusPanel();
+
+                    Chart.RemoveObject(HLDOW_STATUS_NAME_H1);
+                    Chart.RemoveObject(HLDOW_STATUS_NAME_M5);
+
+                    if (_hlDowStatusTextM5 != null)
+                    {
+                        _hlDowStatusTextM5.Text = m5Line;
+                        _hlDowStatusTextM5.ForegroundColor = ResolveHlDowStateColor(m5State);
+                    }
+
+                    if (_hlDowStatusTextH1 != null)
+                    {
+                        _hlDowStatusTextH1.Text = h1Line;
+                        _hlDowStatusTextH1.ForegroundColor = ResolveHlDowStateColor(h1State);
+                    }
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        private void RemoveHlDowStatusDisplay()
+        {
+            _hlDowLastDrawnH1Text = "";
+            _hlDowLastDrawnM5Text = "";
+
+            Action removeAction = () =>
+            {
+                try
+                {
+                    if (Chart == null)
+                        return;
+
+                    Chart.RemoveObject(HLDOW_STATUS_NAME_H1);
+                    Chart.RemoveObject(HLDOW_STATUS_NAME_M5);
+
+                    if (_hlDowStatusPanel != null)
+                    {
+                        try
+                        {
+                            Chart.RemoveControl(_hlDowStatusPanel);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    _hlDowStatusPanel = null;
+                    _hlDowStatusTextM5 = null;
+                    _hlDowStatusTextH1 = null;
+                }
+                catch
+                {
+                }
+            };
+
+            try
+            {
+                BeginInvokeOnMainThread(removeAction);
+            }
+            catch
+            {
+                removeAction();
+            }
+        }
+
+        private DateTime UtcNow()
+        {
+            return DateTime.SpecifyKind(Server.Time, DateTimeKind.Utc);
+        }
+
+        private string BuildTimeTag(DateTime utc)
+        {
+            if (!EnableProReport)
+                return string.Empty;
+
+            DateTime jst = ToJst(utc);
+            string u = utc.ToString("yyyy/MM/dd HH:mm:ss", CultureInfo.InvariantCulture);
+            string j = jst.ToString("yyyy/MM/dd HH:mm:ss", CultureInfo.InvariantCulture);
+            return string.Format(CultureInfo.InvariantCulture, " | Utc={0} | Jst={1}", u, j);
+        }
+
+        private DateTime ToJst(DateTime utc)
+        {
+            DateTime u = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
+
+            if (_jstTz != null)
+            {
+                try { return TimeZoneInfo.ConvertTimeFromUtc(u, _jstTz); } catch { }
+            }
+
+            return u.AddHours(9);
+        }
+
+        private TimeZoneInfo ResolveTokyoTimeZone()
+        {
+            string[] candidateIds = new[] { "Tokyo Standard Time", "Asia/Tokyo" };
+            foreach (string id in candidateIds)
+            {
+                try { return TimeZoneInfo.FindSystemTimeZoneById(id); } catch { }
+            }
+
+            return null;
+        }
+
+        // ============================================================
+        // 描画名・対象判定（034から抜き出し）
+        // ============================================================
+        private static string HL_SanitizeNameToken(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "NA";
+
+            var sb = new StringBuilder(value.Length);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if ((c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9'))
+                {
+                    sb.Append(c);
+                }
+                else
+                {
+                    sb.Append('_');
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private string HL_BuildObjectName(string tf, string kind, int indexA, int sideA, int indexB, int sideB, int sequence)
+        {
+            string symbolToken = HL_SanitizeNameToken(SymbolName);
+            string timeframeToken = HL_SanitizeNameToken(Bars != null ? Bars.TimeFrame.ToString() : "NA");
+            string tfToken = HL_SanitizeNameToken(tf);
+            string kindToken = HL_SanitizeNameToken(kind);
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}{1}.{2}.HL.{3}.{4}.{5}.{6}.{7}.{8}.{9}",
+                HL_DrawObjectPrefix,
+                symbolToken,
+                timeframeToken,
+                tfToken,
+                kindToken,
+                indexA,
+                sideA,
+                indexB,
+                sideB,
+                sequence);
+        }
+
+        private bool HL_IsDrawObjectTargetName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return false;
+
+            if (name.StartsWith(HL_DrawObjectPrefix, StringComparison.Ordinal) &&
+                name.IndexOf(".HL.", StringComparison.Ordinal) >= 0)
+                return true;
+
+            for (int i = 0; i < HL_OldDrawObjectPrefixes.Length; i++)
+            {
+                string oldPrefix = HL_OldDrawObjectPrefixes[i];
+                if (!string.IsNullOrEmpty(oldPrefix) &&
+                    name.StartsWith(oldPrefix, StringComparison.Ordinal) &&
+                    name.IndexOf(".HL.", StringComparison.Ordinal) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        // ============================================================
+        // 描画（Env=H1 / Entry=M5 固定）
+        // ============================================================
+        private void HL_RedrawPivots()
+        {
+            if (Chart == null)
+                return;
+
+            if (_hlRedrawPending)
+                return;
+
+            _hlRedrawPending = true;
+            try
+            {
+                BeginInvokeOnMainThread(() =>
+                {
+                    int drawCount = 0;
+                    try
+                    {
+                        HL_ClearDrawings(true);
+
+                        if (HL_ログ毎バー出す)
+                        {
+                            Print("HL_BAR | M5={0} | H1={1}",
+                                HL_FormatLastPivot(_m5Pivots),
+                                HL_FormatLastPivot(_h1Pivots));
+                        }
+
+                        if (_m5Pivots != null && _m5Pivots.Count >= 2)
+                            drawCount += HL_DrawSeries("M5", new List<HL_Pivot>(_m5Pivots), Color.Red);
+
+                        if (_h1Pivots != null && _h1Pivots.Count >= 2)
+                            drawCount += HL_DrawSeries("H1", new List<HL_Pivot>(_h1Pivots), Color.White);
+
+                        if (HL_ログ毎バー出す)
+                            Print("HL_REDRAW | DrawCount={0}", drawCount);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (HL_ログ毎バー出す)
+                            Print("HL_REDRAW_ERROR: " + ex.Message);
+                    }
+                    finally
+                    {
+                        _hlRedrawPending = false;
+                    }
+                });
+            }
+            catch
+            {
+                _hlRedrawPending = false;
+            }
+        }
+
+        private int HL_DrawSeries(string tf, List<HL_Pivot> pivots, Color lineColor)
+        {
+            int drawCount = 0;
+            for (int i = 0; i < pivots.Count - 1; i++)
+            {
+                var a = pivots[i];
+                var b = pivots[i + 1];
+                string lineName = HL_BuildObjectName(tf, "LINE", a.Index, a.Side, b.Index, b.Side, i);
+
+                Chart.DrawTrendLine(lineName, a.Time, a.Price, b.Time, b.Price, lineColor, 1, LineStyle.Solid);
+                _hlDrawNames.Add(lineName);
+                drawCount++;
+            }
+
+            double yOffset = Math.Max(0, HL_LabelYOffsetTicks) * Symbol.TickSize;
+
+            for (int i = 0; i < pivots.Count; i++)
+            {
+                var p = pivots[i];
+                string text = HL_GetPivotDisplayText(p);
+                Color textColor = HL_GetPivotDisplayColor(p, text);
+
+                double y = p.Side == 1 ? p.Price + yOffset : p.Price - yOffset;
+                string textName = HL_BuildObjectName(tf, "TEXT", p.Index, p.Side, p.Index, p.Side, i);
+                var t = Chart.DrawText(textName, text, p.Time, y, textColor);
+                t.FontSize = HL_LabelFontSize;
+                t.VerticalAlignment = VerticalAlignment.Center;
+                t.HorizontalAlignment = HorizontalAlignment.Center;
+                _hlDrawNames.Add(textName);
+                drawCount++;
+            }
+
+            return drawCount;
+        }
+
+        private void HL_ClearDrawings(bool forceClean = false)
+        {
+            if (Chart == null)
+            {
+                _hlDrawNames.Clear();
+                return;
+            }
+
+            int removedCount = 0;
+            int failedCount = 0;
+            int loggedFailedNameCount = 0;
+
+            for (int i = 0; i < _hlDrawNames.Count; i++)
+            {
+                string name = _hlDrawNames[i];
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                try
+                {
+                    Chart.RemoveObject(name);
+                    removedCount++;
+                }
+                catch
+                {
+                    failedCount++;
+                    if (HL_ログ毎バー出す && loggedFailedNameCount < HL_ForceCleanLogNameLimit)
+                    {
+                        Print("HL_CLEAR_REMOVE_FAILED | Name={0}", name);
+                        loggedFailedNameCount++;
+                    }
+                }
+            }
+
+            _hlDrawNames.Clear();
+            _hlClearCallCount++;
+
+            int forceRemovedCount = 0;
+            int forceFailedCount = 0;
+            if (forceClean)
+                forceRemovedCount = HL_ForceCleanDrawingsByPrefix(out forceFailedCount);
+
+            if (HL_ログ毎バー出す)
+            {
+                Print(
+                    "HL_CLEAR_DRAWINGS | RemovedCount={0} FailedCount={1} | PrefixRemovedCount={2} PrefixFailedCount={3} | Force={4} Call={5}",
+                    removedCount,
+                    failedCount,
+                    forceRemovedCount,
+                    forceFailedCount,
+                    forceClean ? "Y" : "N",
+                    _hlClearCallCount);
+            }
+        }
+
+        private int HL_ForceCleanDrawingsByPrefix(out int failedCount)
+        {
+            failedCount = 0;
+            if (Chart == null)
+                return 0;
+
+            var names = new List<string>(256);
+            try
+            {
+                foreach (var obj in Chart.Objects)
+                {
+                    if (obj == null)
+                        continue;
+
+                    string name = obj.Name;
+                    if (HL_IsDrawObjectTargetName(name))
+                        names.Add(name);
+                }
+            }
+            catch
+            {
+                // 列挙失敗時もEA継続
+            }
+
+            int removedCount = 0;
+            int loggedRemovedNameCount = 0;
+            int loggedFailedNameCount = 0;
+
+            for (int i = 0; i < names.Count; i++)
+            {
+                string name = names[i];
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                try
+                {
+                    Chart.RemoveObject(name);
+                    removedCount++;
+
+                    if (HL_ログ毎バー出す && loggedRemovedNameCount < HL_ForceCleanLogNameLimit)
+                    {
+                        Print("HL_FORCE_CLEAN_REMOVED | Name={0}", name);
+                        loggedRemovedNameCount++;
+                    }
+                }
+                catch
+                {
+                    failedCount++;
+                    if (HL_ログ毎バー出す && loggedFailedNameCount < HL_ForceCleanLogNameLimit)
+                    {
+                        Print("HL_FORCE_CLEAN_FAILED | Name={0}", name);
+                        loggedFailedNameCount++;
+                    }
+                }
+            }
+
+            return removedCount;
+        }
+    }
+}
+

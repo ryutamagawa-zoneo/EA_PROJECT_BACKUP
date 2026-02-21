@@ -1,0 +1,217 @@
+FundedHIVE Compliance Layer 移植標準手順書
+
+（HIVE_010_005 作業内容まとめ）
+
+1. 目的
+
+既存の売買ロジック（BASE EA）を一切改変せずに、
+FundedHIVE（PAP / NewBee）対応のリスク制御層（Compliance Layer）を上乗せする。
+
+重要原則：
+
+BASEロジックはノータッチ
+
+Complianceは独立クラスとして実装
+
+取引可否の制御のみ行う
+
+ベース内部状態に依存しない
+
+2. 実装構造（最終形）
+レイヤー構造
+
+BASE EA（売買ロジック）
+　↓
+HiveComplianceController（追加）
+　↓
+TradePermissionゲートで制御
+
+3. 追加した要素
+3.1 追加パラメータ（資金管理グループ内）
+InitialBalanceForPass      // 合格判定用初期残高
+PassStopProfitPercent      // 合格停止％
+DailyStopLossPercent       // 日次停止％（LOW想定1.8）
+
+
+※既存パラメータには一切変更なし
+
+4. StopMode（状態管理）
+0 = 通常
+1 = 日次停止
+2 = 永久停止（合格）
+
+
+優先順位：2 > 1
+
+保持情報：
+
+停止理由
+
+停止期限（Mode=1時）
+
+日次アンカー
+
+当日開始Equity
+
+5. 日次定義（今回確定仕様）
+
+日次切替：JST 09:00 固定
+
+日次損失分母：当日開始時点の Equity
+
+判定は OnTick + OnTimer 両方で評価
+
+OnTimer周期はベース現状維持
+
+6. 判定ロジック
+6.1 日次損失
+LossPct = (DayStartEquity - CurrentEquity) / DayStartEquity * 100
+
+
+LossPct >= DailyStopLossPercent で
+
+→ StopMode = 1
+→ TradePermission = false
+→ 全決済実行
+
+6.2 合格停止
+ProfitPct = (Equity - InitialBalanceForPass) / InitialBalanceForPass * 100
+
+
+ProfitPct >= PassStopProfitPercent で
+
+→ StopMode = 2
+→ TradePermission = false
+→ 全決済
+→ Stop() を1回だけ実行
+
+7. 停止時の強制処理（C：Close）
+
+順序固定：
+
+保留注文全キャンセル
+
+全ポジションクローズ
+
+仕様：
+
+失敗した対象のみ再試行
+
+最大3回
+
+全完了後は再実行しない（ガード）
+
+8. 取引許可ゲート接続方法
+
+ベースの新規注文直前に既に存在していた：
+
+if (!TradePermission) return;
+
+
+今回の作業では、
+
+ゲートは追加しない
+
+ComplianceがTradePermissionを書き換えるのみ
+
+9. ログ規律
+
+常時ログは禁止。
+
+イベント時のみ出力：
+
+COMPLIANCE_INIT
+
+COMPLIANCE_STOP
+
+COMPLIANCE_LIQUIDATE
+
+COMPLIANCE_LIQUIDATE_DONE
+
+COMPLIANCE_RESUME
+
+COMPLIANCE_BOT_STOP
+
+同一状態の連続ログは禁止。
+
+10. バックテスト確認結果
+日次停止
+
+確認済み：
+
+StopMode=1 発動
+
+TradePermission=false
+
+停止中は新規発注ゼロ
+
+翌JST09:00で解除
+
+DayStartEquity再設定
+
+合格停止
+
+確認済み：
+
+StopMode=2
+
+全決済完了
+
+Stop() が1回のみ
+
+11. 今後のベース移植時の手順
+Step1：ベース棚卸し
+
+確認箇所：
+
+OnStart
+
+OnTick
+
+OnTimer
+
+新規注文直前
+
+保留注文管理箇所
+
+ポジション管理箇所
+
+Step2：Complianceクラス移植
+
+クラス丸ごと追加
+
+パラメータ追加
+
+OnStartで初期化
+
+OnTick / OnTimerでUpdate呼び
+
+TradePermissionへ接続
+
+Step3：検証
+
+最低確認項目：
+
+JST09:00日次リセット
+
+日次停止発動
+
+停止中発注ブロック
+
+合格停止→Stop()
+
+ログ肥大なし
+
+12. 今回の重要ポイント
+
+ベース売買ロジックは一切変更していない
+
+ゲートは既存を流用
+
+日次はEquity基準
+
+09:00固定
+
+停止はイベント駆動
+
+Stop()は1回のみ

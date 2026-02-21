@@ -1,0 +1,169 @@
+FundedHIVE Compliance Layer
+
+汎用テンプレート設計書（Core非依存版）
+
+1. 設計原則
+
+■ Core完全ノータッチ
+■ Complianceは独立クラス
+■ Coreとの接点は3箇所のみ
+
+OnStart
+OnTick / OnTimer
+新規注文直前のTradePermission参照
+
+2. 必須パラメータ（固定3点）
+InitialBalanceForPass : double
+PassStopProfitPercent : double
+DailyStopLossPercent : double
+
+
+これ以外はテンプレートに含めない。
+
+3. Complianceクラス構造（抽象形）
+class HiveComplianceController
+{
+    int StopMode;                 // 0,1,2
+    DateTime StopUntilUtc;        // Mode1用
+    DateTime DayAnchorJst;        // 09:00基準
+    double DayStartEquity;        // 分母
+    bool LiquidationExecuted;     // G1ガード
+    bool StopExecuted;            // Stop()ガード
+
+    void Initialize(...)
+    void Update(...)
+    void EvaluateDailyLoss(...)
+    void EvaluatePass(...)
+    void ExecuteLiquidation(...)
+}
+
+4. 日次設計（固定）
+
+■ 日次アンカー：JST 09:00
+■ 分母：当日開始Equity
+■ 判定は毎Tick + Timer
+
+if (NowJst >= DayAnchorJst + 1day)
+{
+    DayAnchorJst = 09:00更新
+    DayStartEquity = CurrentEquity
+    StopMode = 0
+}
+
+5. 日次損失ロジック（抽象式）
+lossPct =
+(DayStartEquity - CurrentEquity)
+/ DayStartEquity * 100
+
+if lossPct >= DailyStopLossPercent
+{
+    StopMode = 1
+    TradePermission = false
+    StopUntilUtc = 次JST09:00
+}
+
+6. 合格停止ロジック
+profitPct =
+(CurrentEquity - InitialBalanceForPass)
+/ InitialBalanceForPass * 100
+
+if profitPct >= PassStopProfitPercent
+{
+    StopMode = 2
+    TradePermission = false
+}
+
+
+優先順位：
+
+if Mode2 then ignore Mode1
+
+7. 停止時強制処理（必須仕様）
+
+順序固定：
+
+保留注文全キャンセル
+
+全ポジションクローズ
+
+条件：
+
+■ 失敗対象のみ再試行
+■ 最大3回
+■ 完了後は再実行禁止
+
+if StopMode != 0 && !LiquidationExecuted
+    ExecuteLiquidation()
+
+8. Stop() 実行条件
+if StopMode == 2
+   && Liquidation完了
+   && !StopExecuted
+       bot.Stop()
+
+
+1回のみ。
+
+9. Coreとの接続インターフェース
+
+Core側は以下のみ実装：
+
+① OnStart
+compliance = new HiveComplianceController(...)
+
+② OnTick / OnTimer
+compliance.Update(CurrentEquity, Server.Time)
+
+③ 新規注文直前
+if (!TradePermission) return;
+
+
+※ 既存ゲートを流用すること
+
+10. ログ規律テンプレ
+
+許可：
+
+INIT
+DAY_RESET
+STOP_TRIGGERED
+LIQUIDATE_START
+LIQUIDATE_DONE
+RESUME
+BOT_STOP
+
+
+禁止：
+
+・毎Tickログ
+・状態未変化ログ
+・同一StopModeの繰り返し出力
+
+11. 移植チェックリスト（毎回使用）
+
+□ ベースロジック未変更
+□ 取引回数が極端に減っていない
+□ 日次09:00で必ずリセット
+□ 停止中に新規発注ゼロ
+□ 合格時Stop()1回のみ
+□ ログ肥大なし
+
+12. よくある事故ポイント
+
+日次基準がBalanceとEquityで混在
+
+09:00/09:30混在
+
+Stop()多重実行
+
+全決済ループ暴走
+
+ゲートが強すぎて年間数回しか取引しない
+
+13. このテンプレの強み
+
+■ ベース差し替えに強い
+■ 再移植可能
+■ ロジック汚染ゼロ
+■ FundedHIVE LOW準拠
+■ 拡張可能（ニュース制御など追加可）
