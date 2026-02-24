@@ -1,0 +1,280 @@
+# EA_BASE_HL_MIX 修正指示書
+# 宛先: GPT5.3 CODEX
+# 対象: EA_BASE_HL_MIX.cs (10,089行)
+# 作成: Claude Opus コードレビューに基づく
+
+---
+
+## 共通ルール
+
+- 修正箇所以外は一切変更しないこと
+- 変更前後の行番号を明記すること
+- 修正理由を各項に記載しているので、ロジック意図を正確に反映すること
+- コンパイルが通る完全なコードで提示すること
+- 日本語コメントは既存のスタイルに合わせること
+
+---
+
+## 修正2: `ClampVolumeByMaxLots` の二重呼び出し除去
+
+### 箇所
+`TryEntryFramework()` 内、L4906 と L4910
+
+### 現状コード
+```csharp
+volumeInUnits = ClampVolumeByMaxLots(volumeInUnits); // L4906
+
+// COREMODE: SL/TP always enabled immediately
+// 最終直前ガード（反映遅延対策）
+volumeInUnits = ClampVolumeByMaxLots(volumeInUnits); // L4910
+```
+
+### 修正内容
+L4906 の `volumeInUnits = ClampVolumeByMaxLots(volumeInUnits);` を**削除**する。
+L4910 の1回のみ残す（最終直前ガードの直前で1回だけ実行する意図）。
+
+### 修正理由
+コピー&ペースト由来の重複。冪等操作のため実害はないが、意図が不明瞭になり保守性を損なう。
+
+---
+
+## 修正3: `AppendJsonlLine` 2引数版のログガード追加
+
+### 箇所
+L252-271 の2引数版 `AppendJsonlLine(string filePath, string jsonLine)`
+
+### 現状コード
+```csharp
+private void AppendJsonlLine(string filePath, string jsonLine)
+{
+    // 途中改行/途切れ防止：必ず1行=1JSONで追記する
+    if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(jsonLine))
+        return;
+
+    string line = jsonLine.Replace("\r", "").Replace("\n", "") + "\n";
+
+    try
+    {
+        lock (_emaSnapshotFileLock)
+        {
+            File.AppendAllText(filePath, line, Encoding.UTF8);
+        }
+    }
+    catch
+    {
+        // 観測ログ用。例外で取引ロジックを止めない。
+    }
+}
+```
+
+### 修正内容
+メソッド先頭に `EnableProReport` ガードを追加する：
+
+```csharp
+private void AppendJsonlLine(string filePath, string jsonLine)
+{
+    // PROレポートOFF時は書き込みしない（3引数版との整合）
+    if (!EnableProReport)
+        return;
+
+    // 途中改行/途切れ防止：必ず1行=1JSONで追記する
+    if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(jsonLine))
+        return;
+
+    string line = jsonLine.Replace("\r", "").Replace("\n", "") + "\n";
+
+    try
+    {
+        lock (_emaSnapshotFileLock)
+        {
+            File.AppendAllText(filePath, line, Encoding.UTF8);
+        }
+    }
+    catch
+    {
+        // 観測ログ用。例外で取引ロジックを止めない。
+    }
+}
+```
+
+### 修正理由
+3引数版（L451）は `_observationLogEnabled` ガードで保護されているが、2引数版はガードなし。`EnableProReport=false` でも EMA_SNAPSHOT / ATR_ENV_EVAL が書き込まれる経路が存在する。3引数版との動作整合をとる。
+
+---
+
+## 修正4: `OnStop` のイベントハンドラ登録整合
+
+### 箇所
+`OnStart()` 内の Positions.Closed イベント登録部（L2332付近）と `OnStop()` 内の解除部（L2411）
+
+### 現状コード
+
+OnStart内:
+```csharp
+Positions.Closed += OnPositionClosed; // L2332 のみ
+```
+
+OnStop内:
+```csharp
+Positions.Closed -= OnPositionsClosedForProReport; // L2411
+// ...
+Positions.Closed -= OnPositionClosed; // L2415
+```
+
+### 修正内容
+`OnStart()` の `Positions.Closed += OnPositionClosed;`（L2332）の直後に、ProReport用ハンドラの条件付き登録を追加する：
+
+```csharp
+Positions.Closed += OnPositionClosed;
+
+// PROレポート用ハンドラ（ProReport有効時のみ登録）
+if (EnableProReport)
+{
+    Positions.Closed += OnPositionsClosedForProReport;
+}
+```
+
+### 修正理由
+`OnStop()` で `-= OnPositionsClosedForProReport` しているが、対応する `+=` がOnStart内に見当たらない。未登録ハンドラの解除はC#では例外にならないが、ProReport集計（`_proClosedTrades`）にデータが入らない可能性がある。OnStartでの明示的な登録を追加し、OnStopの解除と対にする。
+
+---
+
+## 修正5: HL同値許容のKind判定修正
+
+### 箇所
+`HL_AssignPivotKindsByDisplayRule()` L9504-9530
+
+### 現状コード
+```csharp
+if (p.Side == 1)
+{
+    if (!prevHigh.HasValue) p.Kind = "H";
+    else if (Math.Abs(p.Price - prevHigh.Value) <= tolerancePrice) p.Kind = "HH";
+    else p.Kind = p.Price > prevHigh.Value ? "HH" : "LH";
+    prevHigh = p.Price;
+}
+else if (p.Side == -1)
+{
+    if (!prevLow.HasValue) p.Kind = "L";
+    else if (Math.Abs(p.Price - prevLow.Value) <= tolerancePrice) p.Kind = "HL";
+    else p.Kind = p.Price > prevLow.Value ? "HL" : "LL";
+    prevLow = p.Price;
+}
+```
+
+### 修正内容
+同値許容内を「前回と同じ方向（更新なし）」として扱うよう修正する。High側の同値は直前Kind維持（"H"扱い）、Low側も同様：
+
+```csharp
+if (p.Side == 1)
+{
+    if (!prevHigh.HasValue) p.Kind = "H";
+    else if (Math.Abs(p.Price - prevHigh.Value) <= tolerancePrice) p.Kind = "H"; // 同値=更新なし
+    else p.Kind = p.Price > prevHigh.Value ? "HH" : "LH";
+    prevHigh = p.Price;
+}
+else if (p.Side == -1)
+{
+    if (!prevLow.HasValue) p.Kind = "L";
+    else if (Math.Abs(p.Price - prevLow.Value) <= tolerancePrice) p.Kind = "L"; // 同値=更新なし
+    else p.Kind = p.Price > prevLow.Value ? "HL" : "LL";
+    prevLow = p.Price;
+}
+```
+
+### 修正理由
+Dow Theory的に同値は「高値更新/安値切り上げ」とはみなさない。現状では同値許容内をHH/HLとして扱うため、レンジ相場でトレンド誤認が発生しうる。同値は「構造的に中立（H/L）」として扱い、HH/HL/LH/LLの判定は明確な更新がある場合のみとする。
+
+**注意**: この修正によりHLフィルターのトレンド遷移タイミングが変化する。`HL_EqualTolerancePips=0.0`（デフォルト）の場合は挙動変化なし。バックテストで前後比較を推奨。
+
+---
+
+## 修正6: UpTrend/DownTrend中のrefHigh/refLow出力値クリーンアップ
+
+### 箇所
+`HL_DetermineTrendFromDowStateMachine()` 内 UpTrend処理部 L9742-9758 / DownTrend処理部 L9762-9778
+
+### 現状コード（UpTrend部）
+```csharp
+// UpTrend
+if (state == TrendState.UpTrend)
+{
+    // ... (keyHL更新・ブレイク判定) ...
+    
+    // L9758: UpTrend維持のreturn
+    refHigh = trendLessRefHigh; refLow = defenseLow; triggerHigh = trendLessRefHigh; return state;
+}
+```
+
+### 修正内容（UpTrend部）
+UpTrend維持時の出力を、UpTrend中の意味のある値に変更する：
+
+```csharp
+    // UpTrend維持時: refHighは最新の高値ピボット、refLowはkeyHL（押し安値）
+    refHigh = latestHighPivot; refLow = keyHL; triggerHigh = null; return state;
+```
+
+### 修正内容（DownTrend部）
+DownTrend維持時の出力も同様に修正する（L9777）：
+
+```csharp
+    // DownTrend維持時: refHighはkeyLH（戻り高値）、refLowは最新の安値ピボット
+    refHigh = keyLH; refLow = latestLowPivot; triggerLow = null; return state;
+```
+
+### 修正理由
+UpTrend/DownTrend中に `trendLessRefHigh` / `defenseLow`（TrendLess時代の残骸値）を出力しても意味がない。現時点ではログ出力にのみ影響するが、将来これらの値をトレード判定に使う可能性を考慮し、状態に即した正しい値を出力するよう修正する。
+
+---
+
+## 修正8: `_rrRelaxPendingActive` のポジションクローズ時リセット
+
+### 箇所
+`OnPositionClosed()` L8565-8651
+
+### 修正内容
+`OnPositionClosed()` 内の `_structureTpBoostedPosIds.Remove(p.Id);`（L8616）の直前に、RR緩和Pending状態のリセットを追加する：
+
+```csharp
+    // RR緩和Pending: ポジションクローズで状態リセット（不要な緩和残存を防止）
+    if (_rrRelaxPendingActive)
+    {
+        _rrRelaxPendingActive = false;
+        _rrRelaxOriginBarIndex = -1;
+    }
+
+    _structureTpBoostedPosIds.Remove(p.Id);
+```
+
+### 修正理由
+`_rrRelaxPendingActive` はRR不足時に次バー以降の緩和閾値適用を制御するフラグだが、Window超過（バー数経過）以外にリセット経路がない。ポジションがクローズされた時点で前回のRR緩和コンテキストは無効となるため、明示的にリセットする。これにより、前回ポジションのRR不足判定が次のエントリーに影響する問題を防止する。
+
+---
+
+## 軽微修正C: デッドコード除去
+
+### 箇所
+`InitializeEntryDecisionLogging()` L365
+
+### 現状コード
+```csharp
+string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+_entryDecisionJsonlPath = Path.Combine(ResolveProOutputDirectory(), "ENTRY_DECISION_" + GetCodeNumberTag() + ".jsonl");
+```
+
+### 修正内容
+未使用の `stamp` 変数宣言を削除する：
+
+```csharp
+_entryDecisionJsonlPath = Path.Combine(ResolveProOutputDirectory(), "ENTRY_DECISION_" + GetCodeNumberTag() + ".jsonl");
+```
+
+### 修正理由
+`stamp` は宣言後一度も参照されていない。コンパイラ警告の原因となる。
+
+---
+
+## 軽微修正D: コメント途中切れの修正
+
+### 箇所
+L1940

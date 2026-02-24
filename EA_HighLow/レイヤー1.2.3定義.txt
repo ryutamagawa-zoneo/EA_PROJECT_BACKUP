@@ -1,0 +1,71 @@
+■ Layer1（一本インパルス）
+
+直前pivot → 最新pivot が
+
+LL → HH
+
+HH → LL
+
+ピボット間に他の確定ピボットは存在しない（＝連結2点構造）
+
+TrendStateは使用しない
+
+アンカー：
+
+Up：LL → HH
+
+Down：HH → LL
+
+■ Layer2（構造破壊・転換初動）
+
+重要LH = 直近LLの直前のLH
+
+重要HL = 直近HHの直前のHL
+
+Up方向：
+
+最新HH > 重要LH
+
+アンカー：直近LL → 最新HH
+
+同一重要LHでは1回のみ発火
+
+Down方向：
+
+最新LL < 重要HL
+
+アンカー：直近HH → 最新LL
+
+同一重要HLでは1回のみ発火
+
+TrendStateは使用しない。
+
+■ Layer3（継続トレンド波）
+
+Up継続：
+
+最新がHH
+
+その直前にHLが存在
+
+アンカー：HL → HH
+
+Down継続：
+
+最新がLL
+
+その直前にLHが存在
+
+アンカー：LH → LL
+
+TrendStateは使用しない。
+
+さらに重要なのは、
+
+判定順は Layer1 → Layer2 → Layer3 固定
+
+毎バー判定禁止（確定ピボット追加時のみ）
+
+最新1本のみ描画
+
+TrendStateは完全に無関係

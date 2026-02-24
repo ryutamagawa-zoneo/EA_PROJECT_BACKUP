@@ -1,2 +1,0 @@
-git config --global user.name "ZONEO"
-git config --global user.email "ryu.tamagawa@gmail.com"

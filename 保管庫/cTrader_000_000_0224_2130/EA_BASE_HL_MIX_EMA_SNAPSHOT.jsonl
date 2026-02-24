@@ -1,0 +1,4 @@
+﻿{"event":"EMA_SNAPSHOT","time_utc_ms":1771936500000,"bar_time_utc_ms":1771936200000,"close_1":5159.67,"close_2":5161.59,"ema_1":5167.958052125105,"ema_2":5168.830478664589,"symbol_raw":"XAUUSD","symbol_norm":"XAUUSD"}
+{"event":"EMA_SNAPSHOT","time_utc_ms":1771936800000,"bar_time_utc_ms":1771936500000,"close_1":5156.32,"close_2":5159.67,"ema_1":5166.849666208428,"ema_2":5167.958052125105,"symbol_raw":"XAUUSD","symbol_norm":"XAUUSD"}
+{"event":"EMA_SNAPSHOT","time_utc_ms":1771937100000,"bar_time_utc_ms":1771936800000,"close_1":5157.84,"close_2":5156.32,"ema_1":5165.991602760006,"ema_2":5166.849666208428,"symbol_raw":"XAUUSD","symbol_norm":"XAUUSD"}
+{"event":"EMA_SNAPSHOT","time_utc_ms":1771937400000,"bar_time_utc_ms":1771937100000,"close_1":5154.42,"close_2":5157.84,"ema_1":5164.889545354291,"ema_2":5165.991602760006,"symbol_raw":"XAUUSD","symbol_norm":"XAUUSD"}

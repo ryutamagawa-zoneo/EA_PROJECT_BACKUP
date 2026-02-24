@@ -1,0 +1,25 @@
+実際にコード上でこうなっています。
+
+起動時にスケール決定
+_pipsScale = (symNorm == "XAUUSD") ? 10 : 1;
+
+UI入力pips → 内部pips 変換（ここを必ず通す）
+InputPipsToInternalPips(inputPips) => inputPips * _pipsScale
+
+内部pips → UI入力pipsへ戻す
+InternalPipsToInputPips(internalPips) => internalPips / _pipsScale
+
+なので、あなたが言っている通り、ここを通さずに比較すると XAUだけ桁がズレて「2〜3pipsのつもりが 20〜30pips扱い」みたいな事故が起きます。
+
+今回の「距離デッドゾーン（2〜3pips）」を入れるときの正しいやり方はどちらかです。
+
+A) パラメータを“UI pips（あなた基準）”で持つ（推奨）
+距離 distInternalPips（= price差 / Symbol.PipSize で出た値。XAUは10倍スケール）を、比較前に必ずUI基準へ戻す。
+
+比較の形：
+
+distUserPips = InternalPipsToInputPips(distInternalPips);
+
+if (distUserPips >= 禁止下限 && distUserPips < 禁止上限) return false;
+
+これなら、パラメータの「2〜3」は常にあなたが見ている“2〜3”の意味になり、XAUでもFXでも同じ感覚で使えます。
