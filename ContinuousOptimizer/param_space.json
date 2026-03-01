@@ -1,0 +1,82 @@
+{
+  "_comment": "最適化対象パラメーターの範囲定義。type=int/float/bool/enum",
+  "_usage": "min/max/step で Grid Search の範囲を指定。values で列挙指定も可能。",
+
+  "EmaPeriod": {
+    "min": 10,
+    "max": 50,
+    "step": 5,
+    "type": "int",
+    "description": "EMA期間"
+  },
+  "DirectionDeadzonePips": {
+    "min": 0.0,
+    "max": 30.0,
+    "step": 5.0,
+    "type": "float",
+    "description": "方向判定デッドゾーン幅（PIPS）"
+  },
+  "DirectionHysteresisExitEnterRatio": {
+    "min": 0.3,
+    "max": 1.0,
+    "step": 0.1,
+    "type": "float",
+    "description": "方向判定ヒステリシス比率"
+  },
+  "DirectionStateMinHoldBars": {
+    "min": 1,
+    "max": 15,
+    "step": 2,
+    "type": "int",
+    "description": "方向状態最短維持バー数"
+  },
+  "MinRRRatio": {
+    "min": 0.5,
+    "max": 2.0,
+    "step": 0.25,
+    "type": "float",
+    "description": "最低RR比"
+  },
+  "EntryMaxDistancePips": {
+    "min": 20.0,
+    "max": 80.0,
+    "step": 10.0,
+    "type": "float",
+    "description": "エントリー最大距離（PIPS）"
+  },
+  "ReapproachWindowBars": {
+    "min": 12,
+    "max": 72,
+    "step": 12,
+    "type": "int",
+    "description": "再接近監視バー数"
+  },
+  "ReapproachMaxDistancePips": {
+    "min": 20.0,
+    "max": 60.0,
+    "step": 10.0,
+    "type": "float",
+    "description": "再接近最大距離（PIPS）"
+  },
+  "CrossCandleMinBodyPips": {
+    "min": 3.0,
+    "max": 10.0,
+    "step": 1.0,
+    "type": "float",
+    "description": "クロス足の最小実体サイズ（PIPS）"
+  },
+  "FixedSLPips": {
+    "min": 20.0,
+    "max": 80.0,
+    "step": 10.0,
+    "type": "float",
+    "description": "固定SL（PIPS）"
+  },
+  "TpMultiplier": {
+    "min": 0.5,
+    "max": 3.0,
+    "step": 0.5,
+    "type": "float",
+    "description": "TP倍率（SL倍率モード時）"
+  }
+}

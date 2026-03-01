@@ -1,0 +1,16 @@
+# cTrader Continuous Optimizer - 依存パッケージ
+# pip install -r requirements.txt
+
+# === 必須 (全モード共通) ===
+# (標準ライブラリのみ: json, csv, os, glob, argparse, time, re, itertools, random)
+# → 追加パッケージ不要
+
+# === 自動モード (--mode auto) で必要 ===
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+Pillow>=10.0.0
+
+# === AI Bayesian最適化 (ai_optimizer.py) で必要 ===
+numpy>=1.24.0
+scikit-learn>=1.3.0
+scipy>=1.11.0

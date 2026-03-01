@@ -1,0 +1,31 @@
+{
+  "_comment": "cTrader Continuous Optimizer - 設定ファイル",
+
+  "cbot_name": "EA_BASE_HL_MIX_023",
+
+  "_template_comment": "AIオプティマイザーが使用するテンプレートcbotset（最良結果のもの）",
+  "cbotset_template": "D:\\ChatGPT EA Development\\プロジェクト\\パラメーター欄保存庫\\HighLow\\100492-3269-12.54%_023_template.cbotset",
+  "cbotset_output_dir": "D:\\ChatGPT EA Development\\プロジェクト\\ContinuousOptimizer\\cbotset_queue",
+
+  "_scan_comment": "cTrader標準レポートのスキャン対象（BASE/1〜96が入っているフォルダ）",
+  "ctrader_report_base_dir": "D:\\ChatGPT EA Development\\プロジェクト\\パラメーター欄保存庫\\BASE",
+
+  "_pro_comment": "カスタムPROレポート（PRO_*.html）もあれば拾う",
+  "pro_report_folder": "D:\\ChatGPT EA Development\\プロジェクト",
+
+  "results_csv": "D:\\ChatGPT EA Development\\プロジェクト\\ContinuousOptimizer\\optimization_results.csv",
+  "results_top_csv": "D:\\ChatGPT EA Development\\プロジェクト\\ContinuousOptimizer\\top_results.csv",
+
+  "search_mode": "grid",
+  "max_iterations": 0,
+  "random_seed": 42,
+
+  "backtest_timeout_seconds": 600,
+  "poll_interval_seconds": 5,
+
+  "sort_by": "NetProfit",
+  "sort_ascending": false,
+  "top_n": 20,
+
+  "ui_coords_file": "ui_coords.json"
+}
